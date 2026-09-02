@@ -14,7 +14,7 @@ repo="${YTSCORE_MIRROR_REPO:-git@github.com:bf-dev/youtube-score-pdf.git}"
 mkdir -p "$mirror"
 rsync -a --delete \
   --exclude '.git' \
-  "$root/main.py" "$root/requirements.txt" "$root/_읽어주세요.txt" "$mirror/"
+  "$root/main.py" "$root/requirements.txt" "$root/README.md" "$root/_읽어주세요.txt" "$mirror/"
 rsync -a --delete --exclude '__pycache__' "$root/ytscore" "$root/ci" "$root/assets" "$mirror/"
 mkdir -p "$mirror/.github"
 rsync -a --delete "$root/.github/workflows" "$mirror/.github/"
@@ -36,5 +36,5 @@ git add -A
 if git diff --cached --quiet; then echo "mirror: nothing to push"; exit 0; fi
 git -c user.name="bf-dev" -c user.email="bfdev.main@gmail.com" \
     commit -m "${1:-sync from the project repo}" -q
-git push -u origin main "${2:-}"
+git push -u origin main
 echo "mirror: pushed to $repo"
