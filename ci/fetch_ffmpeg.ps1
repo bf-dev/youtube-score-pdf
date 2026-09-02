@@ -35,6 +35,8 @@ foreach ($n in @("ffmpeg.exe", "ffprobe.exe")) {
   "{0}  {1:N1} MB" -f $n, ((Get-Item (Join-Path $dst $n)).Length / 1MB)
 }
 & "$dst\ffmpeg.exe" -hide_banner -version | Select-Object -First 1
-$av1 = & "$dst\ffmpeg.exe" -hide_banner -decoders 2>&1 | Select-String -Pattern "libdav1d"
-if (-not $av1) { throw "this ffmpeg has no libdav1d: AV1 videos would decode 0 frames" }
-Write-Host "AV1 decoder present: $($av1[0])"
+$dec = & "$dst\ffmpeg.exe" -hide_banner -decoders 2>&1 | Out-String
+$av1 = ($dec -split "`n") | Where-Object { $_ -match "\bav1\b|libdav1d" }
+if (-not $av1) { throw "this ffmpeg has no AV1 decoder: YouTube AV1 videos would decode 0 frames" }
+Write-Host "AV1 decoders present:"
+$av1 | ForEach-Object { Write-Host "  $($_.Trim())" }
