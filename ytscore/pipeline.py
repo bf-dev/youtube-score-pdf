@@ -794,6 +794,41 @@ def core_fingerprint(comp: np.ndarray, gap: float) -> np.ndarray:
     return cv2.resize(core_crop(comp, gap), (CORE_W, CORE_H), interpolation=cv2.INTER_AREA)
 
 
+HEAD_W, HEAD_H = 320, 24
+HEAD_SAME = 0.30            # <= this, two headers carry the same marks
+
+
+def head_signature(comp: np.ndarray, gap: float) -> np.ndarray:
+    """
+    Binary fingerprint of the rows ABOVE the staff: the measure number and the
+    section marker, and nothing else.
+
+    This is the only thing that separates two systems whose music is genuinely
+    identical from one system the video simply drew twice, and both happen in
+    this customer's videos:
+
+    * sample case 0 prints four bars of rest under one lyric at measures 53-56
+      and again at 57-60. The staves correlate 0.9998 and even the whole slot box
+      correlates past 0.96, because the "Bridge" marker and the two digits are a
+      handful of rows in a 300px box. Measure 57 was being deleted from the PDF.
+    * acceptance video 3 plays every line twice, so the SAME picture (same
+      measure number, same marker, same playhead-free notation) turns up in two
+      separate seven-second spans. Printing it twice would double the score.
+
+    The header band is where those two cases differ, so it is compared on its
+    own, at its own scale, where two digits are a large share of the ink.
+    """
+    rows = np.where(staff_row_coverage(comp, "dark_ink") > 0.40)[0]
+    top = int(rows.min()) if len(rows) else int(0.35 * comp.shape[0])
+    cut = max(0, top - int(round(0.4 * gap)))
+    if cut < 4:
+        return np.zeros((HEAD_H, HEAD_W), bool)
+    # a FIXED ink threshold, not an adaptive one: this band is mostly empty
+    # paper, and rescaling it against its own spread turns compression noise
+    # into "ink", so two composites of the same line stop matching.
+    return signature(comp[:cut], HEAD_W, HEAD_H)
+
+
 def core_match(a: np.ndarray, b: np.ndarray, pad: int = 8) -> float:
     """
     How strongly two systems are the same notation, 1.0 = identical.
@@ -918,6 +953,7 @@ class Cand:
     strip: np.ndarray
     core: np.ndarray            # fixed-size grey picture of the staff core
     box: np.ndarray             # the whole slot box, same scale for every system in a slot
+    head: np.ndarray            # binary mark of the rows above the staff (measure no., marker)
     strength: float             # how dark this system's ink actually gets, 0..1
     cov: float = 0.0            # staff-line coverage of the prepared strip
 
@@ -1013,9 +1049,10 @@ def drop_adjacent_repeats(cands: list[Cand],
                 else core_match(prev.core, c.core)
         else:
             m = 0.0
-        if out and m >= thresh:
+        if out and m >= thresh and jaccard(out[-1].head, c.head) <= HEAD_SAME:
             dropped.append(len(out) + len(dropped))
-            log(f"repeat: system at t={c.t:.1f}s is the previous system redrawn -> dropped")
+            log(f"repeat: system at t={c.t:.1f}s is the previous system redrawn "
+                f"(picture {m:.3f}, same header) -> dropped")
             continue
         out.append(c)
     if dropped:
@@ -1301,7 +1338,7 @@ def run(url: str, workdir: Path, outdir: Path, fps: float, dedup_thresh: float,
     plates = [lay.plate[y0:y1] for y0, y1 in lay.systems]
     targets = [max(0, sp[0] - y0) for sp, (y0, _) in zip(lay.staff_spans, lay.systems)]
     staff_h = [sp[1] - sp[0] for sp in lay.staff_spans]
-    up = int(round(2.0 * lay.staff_gap))
+    up = int(round(4.0 * lay.staff_gap))
     down = int(round(3.5 * lay.staff_gap))
     for t, f in iter_frames(video, fps, lay.width, lay.height):
         nframes += 1
@@ -1319,7 +1356,12 @@ def run(url: str, workdir: Path, outdir: Path, fps: float, dedup_thresh: float,
             # particular, whose denominator counts every off-white pixel -- and 777
             # frames of that video collapsed into 8 "systems" instead of ~28.
             # Anchoring the window on this frame's own staff also absorbs the
-            # 10-20px the display shifts when a line carries lyrics.
+            # 10-20px the display shifts when a line carries lyrics. The window
+            # reaches four staff spaces ABOVE the top line on purpose: the
+            # measure number and the section marker live there, and they are the
+            # only difference between sample case 0's measures 53-56 and 57-60
+            # (four bars of rest under the same lyric). At two spaces the two
+            # never separated and measure 57 was missing from the PDF.
             a = max(0, (top if top >= 0 else targets[si]) - up)
             b = min(g.shape[0], (top if top >= 0 else targets[si]) + staff_h[si] + down)
             core = g[a:b] if b - a >= 8 else g
@@ -1370,6 +1412,8 @@ def run(url: str, workdir: Path, outdir: Path, fps: float, dedup_thresh: float,
     box_fps: list[list[np.ndarray]] = [[cv2.resize(c, (CORE_W, CORE_H),
                                                    interpolation=cv2.INTER_AREA)
                                         for c in cs] for cs in comps]
+    heads: list[list[np.ndarray]] = [[head_signature(c, lay.staff_gap) for c in cs]
+                                     for cs in comps]
     times: list[list[float]] = [[g[0].t for g in gs] for gs in slot_groups]
     if os.environ.get("YTSCORE_DIAG"):
         import pickle
@@ -1417,6 +1461,7 @@ def run(url: str, workdir: Path, outdir: Path, fps: float, dedup_thresh: float,
             strip = render_strip(comps[si][i], lay.polarity, chromes[si])
             candidates.append(Cand(t=times[si][i], si=si, strip=strip,
                                    core=cores[si][i], box=box_fps[si][i],
+                                   head=heads[si][i],
                                    strength=ink_strength(comps[si][i])))
 
     # ---- order across slots, then drop the repeats a rolling display produces.
@@ -1515,7 +1560,12 @@ def run(url: str, workdir: Path, outdir: Path, fps: float, dedup_thresh: float,
         "pdf": str(pdf), "systems_dir": str(strip_dir),
         "elapsed_sec": round(elapsed, 1), "version": APP_VERSION,
     }
-    (outdir / f"{name}.run.json").write_text(json.dumps(result, ensure_ascii=False, indent=2))
+    # encoding is NOT optional here: Path.write_text defaults to the locale
+    # codec, which on the customer's Windows is cp949/cp1252, and a Korean
+    # YouTube title in this JSON then raises UnicodeEncodeError and fails the
+    # whole conversion after the PDF has already been written.
+    (outdir / f"{name}.run.json").write_text(
+        json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
     if not keep_video:
         # the customer's disk is not a video cache: a 4 minute 1080p video is
         # 20-40MB and they will run this dozens of times.
