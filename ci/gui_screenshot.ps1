@@ -31,10 +31,12 @@ public class Win32Cap {
 $dir = Join-Path $PWD "screenshots"
 New-Item -ItemType Directory -Force -Path $dir | Out-Null
 
-$exe = Get-Item (Join-Path $PWD $Exe) -ErrorAction SilentlyContinue
-if (-not $exe) { throw "no exe at $Exe" }
+$path = Join-Path (Get-Location).Path $Exe
+if (-not (Test-Path -LiteralPath $path)) { throw "no exe at $path" }
+$exe = Get-Item -LiteralPath $path
 $base = [System.IO.Path]::GetFileNameWithoutExtension($exe.Name)
-Write-Host "launching $($exe.FullName)"
+if (-not $base) { throw "could not derive a process name from $path" }
+Write-Host "launching $($exe.FullName) (process name $base)"
 
 Get-Process -Name $base -ErrorAction SilentlyContinue | Stop-Process -Force
 

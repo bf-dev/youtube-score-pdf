@@ -923,6 +923,39 @@ def drop_fade_copies(cands: list[Cand], ratio: float = 0.78) -> tuple[list[Cand]
     return out, dropped
 
 
+REPEAT_SAME = 0.96          # >= this, two adjacent systems are the same picture
+
+
+def drop_adjacent_repeats(cands: list[Cand],
+                          thresh: float = REPEAT_SAME) -> tuple[list[Cand], list[int]]:
+    """
+    Drop a system that is simply the previous system printed again.
+
+    Several of these videos redraw the current line part-way through it (a
+    section marker appears, a highlight box switches on, the channel's overlay
+    changes), which starts a new frame group and puts the SAME music on the page
+    twice in a row. Acceptance video 3 had 19 such pairs out of 44 systems.
+
+    The threshold is deliberately strict. Measured on the acceptance set, real
+    consecutive lines of a repetitive drum groove reach 0.90-0.91 (a02 measures
+    26/30/34/38 are different music that looks alike), while a genuine repeat of
+    the same picture sits at 0.99-1.00. Only the second copy goes; a repeat that
+    is really in the music is written with a repeat sign, not by printing the
+    same system twice in a row.
+    """
+    out: list[Cand] = []
+    dropped: list[int] = []
+    for c in cands:
+        if out and core_match(out[-1].core, c.core) >= thresh:
+            dropped.append(len(out) + len(dropped))
+            log(f"repeat: system at t={c.t:.1f}s is the previous system redrawn -> dropped")
+            continue
+        out.append(c)
+    if dropped:
+        log(f"repeat: {len(dropped)} redrawn copies dropped -> {len(out)} systems")
+    return out, dropped
+
+
 def composite_line(group: list[SlotFrame], gap: float = 0.0, trim: int = 1) -> np.ndarray:
     """
     Merge every frame of one line into one strip, via per-pixel MEDIAN.
@@ -1354,6 +1387,7 @@ def run(url: str, workdir: Path, outdir: Path, fps: float, dedup_thresh: float,
                           "cov": c.cov} for c in kept_cands], fh)
 
     kept_cands, faded = drop_fade_copies(kept_cands)
+    kept_cands, repeats = drop_adjacent_repeats(kept_cands)
     cleaned: list[np.ndarray] = [c.strip for c in kept_cands]
 
     if drop_idx:
@@ -1363,6 +1397,10 @@ def run(url: str, workdir: Path, outdir: Path, fps: float, dedup_thresh: float,
         log(f"order: dropped systems {sorted(bad)} by hand -> {len(cleaned)} systems")
 
     report(0.88)
+    if not title_override and not meta.get("title"):
+        # the metadata call can lose a race with YouTube's rate limiter; the
+        # download proved the network works, so it is worth exactly one retry
+        meta = video_meta(url, proxy) or meta
     title = unicodedata.normalize("NFC", title_override) if title_override \
         else video_title(url, name, meta)
     pdf = outdir / f"{name}.pdf"
@@ -1386,7 +1424,7 @@ def run(url: str, workdir: Path, outdir: Path, fps: float, dedup_thresh: float,
         "sampled": nframes, "score_frames": kept, "rejected": rejected,
         "candidates": len(candidates), "unsettled_dropped": unsettled,
         "cross_slot_dupes": dropped_dupes, "slot_mode": mode,
-        "fade_copies_dropped": faded,
+        "fade_copies_dropped": faded, "redrawn_copies_dropped": repeats,
         "systems": len(cleaned), "dropped_by_hand": sorted(drop_idx or []),
         "video_meta": meta, "duration_sec": round(duration, 1),
         "measures_per_system": bars,
