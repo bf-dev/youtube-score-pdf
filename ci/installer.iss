@@ -10,7 +10,7 @@
 
 #define AppName "유튜브 악보 PDF 변환기"
 #define AppSlug "youtube-score-pdf"
-#define AppVersion "1.0.0"
+#define AppVersion "1.0.2"
 
 [Setup]
 AppId={{7E5B1C64-3F8A-4C51-9E2D-1775529A0001}

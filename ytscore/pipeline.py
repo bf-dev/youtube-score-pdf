@@ -141,9 +141,26 @@ def download(url: str, dest: Path, max_height: int = 1080, proxy: str | None = N
     """
     dest.mkdir(parents=True, exist_ok=True)
     out = dest / "video.mp4"
+    # A cached video.mp4 is only a cache for the URL that produced it. The work
+    # dir is reused across conversions, and a run that was cancelled, crashed or
+    # killed leaves its video behind, so an unstamped reuse silently emitted the
+    # PREVIOUS video's score under the NEW video's title. Stamp the source and
+    # only reuse on an exact match; anything else is deleted, not reused.
+    stamp = dest / "source.txt"
+    try:
+        cached_for = stamp.read_text(encoding="utf-8").strip() if stamp.is_file() else ""
+    except Exception:
+        cached_for = ""
     if out.exists() and out.stat().st_size > 0:
-        log(f"download: reusing {out} ({out.stat().st_size} bytes)")
-        return out
+        if cached_for == url:
+            log(f"download: reusing {out} ({out.stat().st_size} bytes)")
+            return out
+        log(f"download: discarding a leftover video from {cached_for or 'an unknown url'}")
+        for leftover in list(dest.glob("video.*")) + list(dest.glob("*.part")):
+            try:
+                leftover.unlink()
+            except Exception:
+                pass
     log(f"download: {url} (<= {max_height}p)" + (" via proxy" if proxy else ""))
     try:
         import yt_dlp
@@ -187,6 +204,10 @@ def download(url: str, dest: Path, max_height: int = 1080, proxy: str | None = N
         if not alt:
             raise DownloadFailed("yt-dlp finished but no video file was written")
         out = alt[0]
+    try:
+        stamp.write_text(url, encoding="utf-8")
+    except Exception:
+        pass
     log(f"download: ok {out.name} {out.stat().st_size} bytes")
     return out
 

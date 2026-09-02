@@ -96,7 +96,9 @@ if (\$pdf.Length -lt 100000) { throw 'PDF too small to be real' }
 \$iscc = "\${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
 & \$iscc ci\installer.iss | Select-Object -Last 5
 if (\$LASTEXITCODE -ne 0) { throw 'ISCC failed' }
-\$setup = Get-ChildItem installer\*.exe | Select-Object -First 1
+# NEWEST, not alphabetically first: installer\ keeps older versions, and
+# `Select-Object -First 1` once reinstalled 1.0.0 over a fresh 1.0.1 build.
+\$setup = Get-ChildItem installer\*.exe | Sort-Object LastWriteTime -Descending | Select-Object -First 1
 "installer: {0}  {1:N1} MB  sha256 {2}" -f \$setup.Name, (\$setup.Length / 1MB), \`
    (Get-FileHash \$setup.FullName -Algorithm SHA256).Hash.ToLower()
 if (\$setup.Length -lt 20MB) { throw 'installer suspiciously small' }
@@ -110,8 +112,8 @@ $SSH "powershell -ExecutionPolicy Bypass -File C:\\builder\\ytscore-build.ps1" 2
 # ---- 3. GUI screenshot with a real conversion on screen, in session 1 --------
 # PrintWindow, not CopyFromScreen: the builder's console framebuffer goes stale
 # after a reboot and a screen grab silently returns a frozen desktop.
-HOLD_MS=${HOLD_MS:-2400000}
-SETTLE=${SETTLE:-1500}
+HOLD_MS=${HOLD_MS:-1200000}
+SETTLE=${SETTLE:-480}        # the conversion itself measures ~165s on this VM
 cat > /tmp/ytscore-shot.ps1 <<PS1
 \$log = '$REMOTE\screenshots\shot.log'
 try {
@@ -136,7 +138,7 @@ Set-Location '$REMOTE'
 \$exe = '$REMOTE\dist\youtube-score-pdf\youtube-score-pdf.exe'
 \$base = 'youtube-score-pdf'
 Get-Process -Name \$base -ErrorAction SilentlyContinue | Stop-Process -Force
-\$demoArgs = @('--guidemo', '--url=$E2E_URL', '--title=드럼 악보 샘플',
+\$demoArgs = @('--guidemo', '--url=$E2E_URL', '--title=드럼악보샘플',
            '--out=$REMOTE\demo-out', '--hold=$HOLD_MS')
 Start-Process \$exe -ArgumentList \$demoArgs | Out-Null
 \$hwnd = [IntPtr]::Zero
@@ -174,17 +176,33 @@ Get-Process -Name \$base -ErrorAction SilentlyContinue | Stop-Process -Force
 }
 PS1
 push /tmp/ytscore-shot.ps1 ytscore-shot.ps1
+# Delete the previous shot.log and gui.png from HERE, before the task is started.
+# If the scheduled task fails to start at all, the poll below would otherwise read
+# the LAST build's log and report a stale success with no gui.png to show for it.
+# That has happened; do not remove this.
+$SSH "Remove-Item '$REMOTE\\screenshots\\shot.log','$REMOTE\\screenshots\\gui.png' -Force -ErrorAction SilentlyContinue" > /dev/null 2>&1 || true
 log "capturing the GUI in session 1 (a real conversion runs first, ~$((SETTLE / 60)) min)"
 $SSH "schtasks /create /tn ytscore-shot /tr \"powershell -ExecutionPolicy Bypass -WindowStyle Hidden -File C:\\builder\\ytscore-shot.ps1\" /sc once /st 00:00 /ru bfdev /rp '$WINPWD' /it /f | Out-Null
       schtasks /run /tn ytscore-shot | Out-Null" > /dev/null
 deadline=$((SECONDS + SETTLE + 600))
 while [ $SECONDS -lt $deadline ]; do
   sleep 30
-  SHOT=$($SSH "Get-Content '$REMOTE\\screenshots\\shot.log' -ErrorAction SilentlyContinue" 2>/dev/null | tr -d '\r')
-  [ -n "$SHOT" ] && break
+  # `|| true` is NOT decoration. Under `set -e` a bare assignment from a command
+  # substitution inherits that command's exit status, and powershell-over-ssh
+  # returns non-zero while shot.log does not exist yet, so the FIRST poll killed
+  # this script and left the capture running on the VM with nobody to collect it.
+  SHOT=$($SSH "Get-Content '$REMOTE\\screenshots\\shot.log' -ErrorAction SilentlyContinue" 2>/dev/null || true)
+  SHOT=$(printf '%s' "$SHOT" | tr -d '\r')
+  # NOT `[ -n "$SHOT" ] && break`: under `set -e` a false test as the last
+  # statement of the loop body kills the whole script, which is how a finished
+  # build once threw its own artifacts away.
+  if [ -n "$SHOT" ]; then break; fi
 done
 $SSH "schtasks /delete /tn ytscore-shot /f | Out-Null" > /dev/null 2>&1 || true
 log "capture: ${SHOT:-(timed out)}"
+case "${SHOT:-}" in
+  ""|FAILED*) log "GUI capture did not produce a screenshot; treat this build as unverified";;
+esac
 
 # ---- 4. pull everything ------------------------------------------------------
 mkdir -p "$OUT"
@@ -206,7 +224,7 @@ with zipfile.ZipFile(z) as f:
                 name = name.encode("cp437").decode("utf-8")
             except (UnicodeEncodeError, UnicodeDecodeError):
                 pass
-        p = out / name
+        p = out / name.replace("\\", "/")
         if i.is_dir():
             continue
         p.parent.mkdir(parents=True, exist_ok=True)

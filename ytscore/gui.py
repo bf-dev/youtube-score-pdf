@@ -10,6 +10,7 @@ handler is wrapped so a bug shows a dialog instead of killing the program.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import queue
@@ -339,7 +340,11 @@ class App:
                 _s(line)
 
             pipeline.set_log_sink(collect)
-            work = paths.app_data_dir() / "work" / f"job{n}"
+            # Keyed by the URL, not by the position in the queue. "job1" was shared
+            # by the first link of every session, so a leftover download from an
+            # earlier, interrupted conversion sat exactly where the next one looked.
+            work = (paths.app_data_dir() / "work"
+                    / hashlib.sha1(url.encode("utf-8")).hexdigest()[:16])
             name = safe_name(title, "") if title and total == 1 else ""
             result = None
             try:
@@ -372,7 +377,11 @@ class App:
         base = safe_name(title_override or video_title, "악보")
         target = outdir / f"{base}.pdf"
         k = 2
-        while target.exists():
+        # `not samefile` is load-bearing. The pipeline has already written its own
+        # PDF into outdir under a name derived from the SAME title, so on a first
+        # conversion `target` IS `pdf`, `target.exists()` is true, and the loop
+        # used to rename the customer's very first output to "제목 (2).pdf".
+        while target.exists() and not (pdf.exists() and target.samefile(pdf)):
             target = outdir / f"{base} ({k}).pdf"
             k += 1
         try:
