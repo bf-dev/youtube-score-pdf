@@ -23,6 +23,9 @@ DefaultGroupName={#AppName}
 DisableProgramGroupPage=yes
 DisableDirPage=no
 PrivilegesRequired=lowest
+; ISCC resolves every relative path against the .iss file's OWN directory,
+; not the working directory, so ci/installer.iss has to reach back up one level.
+SourceDir=..
 OutputDir=installer
 OutputBaseFilename={#AppSlug}-setup-{#AppVersion}
 Compression=lzma2/max

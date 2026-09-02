@@ -711,8 +711,16 @@ def soft_jaccard(a: np.ndarray, b: np.ndarray) -> float:
     (phase correlation dx=dy=0.00, NCC 0.997). The same pairs measure 0.02-0.14
     here, and a genuinely different line still measures 0.42-0.55.
     """
-    ia = 255.0 - a.astype(np.float32)
-    ib = 255.0 - b.astype(np.float32)
+    # Ink is darkness relative to THIS strip's own paper, not to 255. Acceptance
+    # video 4 prints its score on a translucent panel that sits at grey 210, so
+    # measuring against 255 adds a constant 45 of "ink" to every pixel of empty
+    # paper; the denominator is then dominated by the blank part of the strip and
+    # two completely different systems measure 0.07 instead of 0.4. Every video
+    # whose paper really is white is unaffected (its 90th percentile IS ~255):
+    # measured on videos 1 and 3 the count of detected line changes is identical.
+    paper = max(float(np.percentile(a, 90)), float(np.percentile(b, 90)), 1.0)
+    ia = np.clip(paper - a.astype(np.float32), 0.0, None)
+    ib = np.clip(paper - b.astype(np.float32), 0.0, None)
     denom = float(np.maximum(ia, ib).sum())
     if denom <= 0:
         return 0.0

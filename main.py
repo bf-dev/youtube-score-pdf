@@ -129,7 +129,23 @@ def console() -> int:
     return 0
 
 
+def _utf8_console() -> None:
+    """
+    Our CI modes print Korean (a YouTube title, a status line) to a redirected
+    stdout, whose default encoding on a Korean/US Windows console is cp949/cp1252
+    and raises UnicodeEncodeError on the first Hangul character. Guarded on both
+    sides: in the shipped --noconsole build sys.stdout is None and has no
+    .reconfigure, and that must not be an error either.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
 def main() -> int:
+    _utf8_console()
     sys.excepthook = _hook
     argv = sys.argv[1:]
     if "--version" in argv:
