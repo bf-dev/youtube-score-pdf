@@ -1,0 +1,164 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      # The customer's PC has no ffmpeg, and OpenCV's bundled one cannot decode
+      # the AV1 YouTube serves for many of these videos (it silently returns
+      # zero frames). The app carries its own.
+      - name: bundle ffmpeg
+        shell: pwsh
+        run: powershell -ExecutionPolicy Bypass -File ci\fetch_ffmpeg.ps1
+
+      # --onedir, not --onefile: a onefile exe unpacks itself into %TEMP% on
+      # every launch, which is a minute of nothing happening on a real customer
+      # PC and a Defender heuristic trigger on top.
+      - name: build (onedir)
+        run: >
+          pyinstaller --onedir --noconsole
+          --name youtube-score-pdf
+          --version-file ci/version_info.txt
+          --add-data "assets/NanumGothic.ttf;assets"
+          --add-binary "bin/ffmpeg.exe;bin"
+          --add-binary "bin/ffprobe.exe;bin"
+          --collect-all yt_dlp
+          --hidden-import tkinter
+          --noconfirm
+          main.py
+
+      - name: exe is a real PE and carries its tools
+        shell: pwsh
+        run: |
+          $exe = Get-Item dist\youtube-score-pdf\youtube-score-pdf.exe
+          "{0}  {1:N1} MB" -f $exe.Name, ($exe.Length / 1MB)
+          $fs = [System.IO.File]::OpenRead($exe.FullName)
+          $b = New-Object byte[] 2; $fs.Read($b, 0, 2) | Out-Null; $fs.Close()
+          if ($b[0] -ne 0x4D -or $b[1] -ne 0x5A) { throw "not a PE binary" }
+          $vi = $exe.VersionInfo
+          "version resource: $($vi.ProductName) / $($vi.FileVersion)"
+          if (-not $vi.FileVersion) { throw "version resource missing" }
+          foreach ($p in @("_internal\bin\ffmpeg.exe", "_internal\bin\ffprobe.exe",
+                           "_internal\assets\NanumGothic.ttf")) {
+            if (-not (Test-Path "dist\youtube-score-pdf\$p")) { throw "missing $p" }
+            "bundled: $p"
+          }
+          $size = (Get-ChildItem dist\youtube-score-pdf -Recurse | Measure-Object Length -Sum).Sum
+          "onedir total: {0:N1} MB" -f ($size / 1MB)
+
+      - name: version + GUI construct selftest
+        shell: pwsh
+        run: |
+          $p = Start-Process dist\youtube-score-pdf\youtube-score-pdf.exe -ArgumentList "--version" -PassThru -Wait
+          if ($p.ExitCode -ne 0) { throw "--version failed" }
+          $p = Start-Process dist\youtube-score-pdf\youtube-score-pdf.exe -ArgumentList "--guiselftest" -PassThru -Wait
+          "gui construct exit code: $($p.ExitCode)"
+          if ($p.ExitCode -ne 0) { throw "gui construct failed (tkinter not bundled?)" }
+
+      # The shipped exe must be able to reach the Artifacts API, from the frozen
+      # bundle, with the customer id stamped. matched:true is the proof.
+      - name: artifacts reporter reaches the server from the frozen exe
+        shell: pwsh
+        run: |
+          $log = "artifacts.log"
+          $p = Start-Process dist\youtube-score-pdf\youtube-score-pdf.exe `
+               -ArgumentList "--artifacts-test" -RedirectStandardOutput $log -PassThru -Wait
+          Get-Content $log
+          if ($p.ExitCode -ne 0) { throw "artifacts report did not land (matched:false?)" }
+
+      - name: can this runner reach YouTube
+        id: probe
+        continue-on-error: true
+        run: python ci/probe.py
+
+      # The real thing: the frozen exe downloads a real YouTube video and writes
+      # a real PDF, on Windows, and reports the run back to us.
+      - name: end-to-end conversion from a real YouTube link
+        if: steps.probe.outcome == 'success'
+        shell: pwsh
+        run: |
+          $log = "selftest.log"
+          $p = Start-Process dist\youtube-score-pdf\youtube-score-pdf.exe `
+               -ArgumentList "--selftest","--url=https://youtu.be/2RIsnf--0VY","--out=e2e" `
+               -RedirectStandardOutput $log -PassThru -Wait
+          Get-Content $log -Tail 40
+          if ($p.ExitCode -ne 0) { throw "end-to-end conversion failed" }
+          $pdf = Get-Item e2e\selftest.pdf
+          "PDF: {0:N0} bytes" -f $pdf.Length
+          if ($pdf.Length -lt 20000) { throw "PDF too small to be real" }
+
+      # A real screen capture of the running window with a finished conversion
+      # on it. Not the construct selftest, not a log: the customer's own UI.
+      - name: GUI screenshot (real window, real conversion on screen)
+        if: steps.probe.outcome == 'success'
+        shell: pwsh
+        run: |
+          powershell -ExecutionPolicy Bypass -File ci\gui_screenshot.ps1 `
+            -DemoArgs "--guidemo,--url=https://youtu.be/2RIsnf--0VY,--out=demo-out,--hold=900000" `
+            -Out "gui.png" -SettleSeconds 420
+
+      - name: GUI screenshot (idle window, no network needed)
+        if: steps.probe.outcome != 'success'
+        shell: pwsh
+        run: |
+          powershell -ExecutionPolicy Bypass -File ci\gui_screenshot.ps1 `
+            -DemoArgs "--guidemo,--nostart,--url=https://youtu.be/2RIsnf--0VY,--hold=180000" `
+            -Out "gui.png" -SettleSeconds 20
+
+      - name: build the installer
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup -y --no-progress
+            $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          }
+          & $iscc ci\installer.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed" }
+          $setup = Get-ChildItem installer\*.exe | Select-Object -First 1
+          "installer: {0}  {1:N1} MB" -f $setup.Name, ($setup.Length / 1MB)
+          if ($setup.Length -lt 20MB) { throw "installer suspiciously small" }
+          $h = Get-FileHash $setup.FullName -Algorithm SHA256
+          "sha256: $($h.Hash.ToLower())"
+
+      - name: zip fallback package
+        run: python ci/package_zip.py dist/youtube-score-pdf out
+
+      - name: Defender scan of the delivered installer
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          & "$env:ProgramFiles\Windows Defender\MpCmdRun.exe" -SignatureUpdate | Out-Null
+          $setup = Get-ChildItem installer\*.exe | Select-Object -First 1
+          & "$env:ProgramFiles\Windows Defender\MpCmdRun.exe" -Scan -ScanType 3 -File $setup.FullName -DisableRemediation
+          "defender exit: $LASTEXITCODE"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: youtube-score-pdf
+          path: |
+            installer/*.exe
+            out/*.zip
+            screenshots/*.png
+            e2e/*.pdf
+            selftest.log
+            artifacts.log
+          retention-days: 14
