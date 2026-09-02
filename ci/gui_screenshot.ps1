@@ -33,16 +33,20 @@ New-Item -ItemType Directory -Force -Path $dir | Out-Null
 
 $path = Join-Path (Get-Location).Path $Exe
 if (-not (Test-Path -LiteralPath $path)) { throw "no exe at $path" }
-$exe = Get-Item -LiteralPath $path
-$base = [System.IO.Path]::GetFileNameWithoutExtension($exe.Name)
+# NOT $exe: param() declares [string] $Exe, PowerShell variable names are
+# case-insensitive, and assigning a FileInfo to a [string]-constrained variable
+# silently coerces it back to its path string. $exe.Name is then $null and the
+# process name comes out empty, which is what killed four CI runs.
+$target = (Get-Item -LiteralPath $path).FullName
+$base = [System.IO.Path]::GetFileNameWithoutExtension($target)
 if (-not $base) { throw "could not derive a process name from $path" }
-Write-Host "launching $($exe.FullName) (process name $base)"
+Write-Host "launching $target (process name $base)"
 
 Get-Process -Name $base -ErrorAction SilentlyContinue | Stop-Process -Force
 
 $argList = $DemoArgs.Split(",")
 Write-Host "demo args: $($argList -join ' ')"
-$p = Start-Process $exe.FullName -ArgumentList $argList -PassThru
+$p = Start-Process $target -ArgumentList $argList -PassThru
 
 $hwnd = [IntPtr]::Zero
 for ($i = 0; $i -lt 180; $i++) {

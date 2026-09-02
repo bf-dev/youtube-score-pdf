@@ -39,7 +39,7 @@ jobs:
           --add-data "assets/NanumGothic.ttf;assets"
           --add-binary "bin/ffmpeg.exe;bin"
           --add-binary "bin/ffprobe.exe;bin"
-          --collect-all yt_dlp
+          --collect-all yt_dlp --collect-all pymupdf
           --hidden-import tkinter
           --noconfirm
           main.py

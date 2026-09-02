@@ -251,7 +251,10 @@ def iter_frames(video: Path, fps: float, w: int, h: int):
     these videos and OpenCV's bundled FFmpeg has no AV1 decoder, so it silently
     returns zero frames. The system ffmpeg (libdav1d) handles it.
     """
-    cmd = [paths.ffmpeg(), "-v", "error", "-i", str(video),
+    # -nostdin: ffmpeg reads the console for interactive keys by default, so a
+    # pipeline driven from a shell loop has its own input silently eaten (the
+    # acceptance batch script stopped after three videos for exactly this).
+    cmd = [paths.ffmpeg(), "-v", "error", "-nostdin", "-i", str(video),
            "-vf", f"fps={fps}", "-f", "rawvideo", "-pix_fmt", "bgr24", "-"]
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                             bufsize=10 ** 8, **paths.popen_kwargs())
@@ -414,6 +417,23 @@ def analyse_layout(video: Path, max_frames: int = 140, dump: Path | None = None,
     log(f"analyse: modal layout = {modal} staff group(s) in {len(usable)}/{len(grays)} frames, "
         f"line spacing {gap:.1f}px, groups {spans} with {nlines} line(s)")
 
+    # A staff has at least two lines. Where a real multi-line staff was found, a
+    # LONE horizontal rule in the same frame is never a second system: it is the
+    # beam row that sits above the notation (acceptance videos 9 and 10), the row
+    # of accent beams inside the system (video 8) or the player's bottom border at
+    # y = h-1 (videos 4 and 8). All four were being promoted to a system slot,
+    # which then overlapped the real one, so every line was printed twice: once as
+    # a fragment of beams with no staff, once properly. Videos whose score really
+    # is a single-line rhythm staff have no multi-line group at all and are left
+    # exactly as they were.
+    if max(nlines) >= 2 and min(nlines) < 2:
+        keep_multi = [i for i, n in enumerate(nlines) if n >= 2]
+        log(f"analyse: dropping single-rule group(s) "
+            f"{[spans[i] for i, n in enumerate(nlines) if n < 2]} next to a real "
+            f"{max(nlines)}-line staff")
+        spans = [spans[i] for i in keep_multi]
+        nlines = [nlines[i] for i in keep_multi]
+
     # keep only the groups whose content changes: a score does, a title-card rule
     # or a UI border does not. The probe is restricted to the COLUMNS the ridge
     # actually occupies -- case 1's title-card border passes a full-width probe
@@ -492,6 +512,28 @@ def analyse_layout(video: Path, max_frames: int = 140, dump: Path | None = None,
                 break
         final.append((y0, y1))
     boxes = final
+
+    # Two slots must never share rows. Where they do, the same notation lands in
+    # both crops with a different framing, the cross-slot dedup (which compares
+    # equal-size signatures) cannot see they are the same, and the system is
+    # printed twice. Split the overlap on the midpoint between the two STAFFS,
+    # which is where the eye separates them too.
+    for i in range(len(boxes) - 1):
+        (y0, y1), (n0, n1) = boxes[i], boxes[i + 1]
+        if y1 <= n0:
+            continue
+        cut = (spans[i][1] + spans[i + 1][0]) // 2
+        cut = int(min(max(cut, min(y1, n0)), max(y1, n0)))
+        log(f"analyse: slots {i}/{i+1} overlapped ({y0},{y1})/({n0},{n1}) -> split at {cut}")
+        boxes[i] = (y0, cut)
+        boxes[i + 1] = (cut, n1)
+    tall = [i for i, (a, b) in enumerate(boxes) if b - a >= max(8, int(round(3.0 * gap)))]
+    if not tall:
+        raise ScoreNotFound("staff detected but no usable system band around it")
+    boxes = [boxes[i] for i in tall]
+    spans = [spans[i] for i in tall]
+    nlines = [nlines[i] for i in tall]
+
     if force_band is not None:                    # hand-set band overrides detection
         by0, by1 = force_band
         boxes = [(by0, by1)]
@@ -942,11 +984,28 @@ def drop_adjacent_repeats(cands: list[Cand],
     the same picture sits at 0.99-1.00. Only the second copy goes; a repeat that
     is really in the music is written with a repeat sign, not by printing the
     same system twice in a row.
+
+    Compare the whole SLOT BOX, not the staff core, whenever both systems come
+    from the same slot. The staff core is anchored on the top staff line and is
+    only seven staff spaces tall, so it deliberately excludes the row where the
+    measure number and the section marker are printed -- and that row is the
+    only thing that separates two systems whose music really is identical.
+    Sample case 0 pays for it: its measures 53-56 and 57-60 are four bars of
+    rest under the same lyric, so their cores correlate 0.9998 and the whole of
+    measures 57-60 was being deleted from the PDF. The full box, which is the
+    same crop at the same scale for every system of a slot, correlates 0.30 on
+    that pair and still 1.00 on a genuine redraw.
     """
     out: list[Cand] = []
     dropped: list[int] = []
     for c in cands:
-        if out and core_match(out[-1].core, c.core) >= thresh:
+        if out:
+            prev = out[-1]
+            m = core_match(prev.box, c.box) if prev.si == c.si \
+                else core_match(prev.core, c.core)
+        else:
+            m = 0.0
+        if out and m >= thresh:
             dropped.append(len(out) + len(dropped))
             log(f"repeat: system at t={c.t:.1f}s is the previous system redrawn -> dropped")
             continue
@@ -1233,6 +1292,9 @@ def run(url: str, workdir: Path, outdir: Path, fps: float, dedup_thresh: float,
     nframes = 0
     plates = [lay.plate[y0:y1] for y0, y1 in lay.systems]
     targets = [max(0, sp[0] - y0) for sp, (y0, _) in zip(lay.staff_spans, lay.systems)]
+    staff_h = [sp[1] - sp[0] for sp in lay.staff_spans]
+    up = int(round(2.0 * lay.staff_gap))
+    down = int(round(3.5 * lay.staff_gap))
     for t, f in iter_frames(video, fps, lay.width, lay.height):
         nframes += 1
         if nframes % 20 == 0:
@@ -1240,8 +1302,21 @@ def run(url: str, workdir: Path, outdir: Path, fps: float, dedup_thresh: float,
         for si, (y0, y1) in enumerate(lay.systems):
             g = normalise_ink(f[y0:y1], plates[si], lay.polarity, sat)
             prof = staff_row_coverage(g, "dark_ink")
-            raw_slots[si].append(SlotFrame(t=t, gray=g, key=signature(g), fp=fingerprint(g),
-                                           top=staff_anchor(prof, lay.staff_gap, targets[si])))
+            top = staff_anchor(prof, lay.staff_gap, targets[si])
+            # Group frames on the STAFF, not on the whole box. The box is as tall
+            # as the paper the score is printed on, which on some videos is three
+            # times the notation (acceptance video 4's translucent panel runs from
+            # y=806 to the bottom of the frame for a staff at y=950..1012). The
+            # empty paper then dominates both distances -- the graded one in
+            # particular, whose denominator counts every off-white pixel -- and 777
+            # frames of that video collapsed into 8 "systems" instead of ~28.
+            # Anchoring the window on this frame's own staff also absorbs the
+            # 10-20px the display shifts when a line carries lyrics.
+            a = max(0, (top if top >= 0 else targets[si]) - up)
+            b = min(g.shape[0], (top if top >= 0 else targets[si]) + staff_h[si] + down)
+            core = g[a:b] if b - a >= 8 else g
+            raw_slots[si].append(SlotFrame(t=t, gray=g, key=signature(core),
+                                           fp=fingerprint(core), top=top))
             ridges[si].append(float(prof.max()))
 
     # A frame is a score frame when its staff is actually drawn. The ridge value
