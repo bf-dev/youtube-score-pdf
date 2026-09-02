@@ -32,7 +32,7 @@ def build(dist_dir: Path, out_dir: Path) -> Path:
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
         for p in files:
             zf.write(p, f"{top}/{p.relative_to(dist_dir).as_posix()}")
-        readme = ROOT / "_읽어주세요.txt"
+        readme = ROOT / "readme-ko.txt"
         if readme.is_file():
             zf.writestr(f"{top}/사용안내.txt", readme.read_text(encoding="utf-8"))
     print(f"packaged {zip_path} ({zip_path.stat().st_size:,} bytes, {len(files) + 1} entries)")

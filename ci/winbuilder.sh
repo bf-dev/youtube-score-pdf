@@ -37,7 +37,7 @@ push() {                                  # push <local.ps1> <remote name>
 log "uploading source"
 TAR=$(mktemp /tmp/ytscore-src-XXXX.tar.gz)
 tar czf "$TAR" -C "$ROOT" --exclude=__pycache__ \
-    main.py requirements.txt README.md _읽어주세요.txt ytscore ci assets
+    main.py requirements.txt README.md readme-ko.txt ytscore ci assets
 scp -q -o StrictHostKeyChecking=no "$TAR" "$HOST:C:/ytscore-src.tar.gz"
 rm -f "$TAR"
 $SSH "New-Item -ItemType Directory -Force -Path '$REMOTE' | Out-Null

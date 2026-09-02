@@ -49,7 +49,9 @@ Name: "desktopicon"; Description: "바탕화면에 바로가기 만들기"; Grou
 
 [Files]
 Source: "dist\{#AppSlug}\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs ignoreversion
-Source: "_읽어주세요.txt"; DestDir: "{app}"; Flags: ignoreversion
+; ASCII on disk, Korean once installed: a non-ASCII source name did not
+; survive tar -> Windows on the build VM and ISCC could not find it.
+Source: "readme-ko.txt"; DestDir: "{app}"; DestName: "_읽어주세요.txt"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\{#AppName}"; Filename: "{app}\{#AppSlug}.exe"

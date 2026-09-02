@@ -14,7 +14,7 @@ repo="${YTSCORE_MIRROR_REPO:-git@github.com:bf-dev/youtube-score-pdf.git}"
 mkdir -p "$mirror"
 rsync -a --delete \
   --exclude '.git' \
-  "$root/main.py" "$root/requirements.txt" "$root/README.md" "$root/_읽어주세요.txt" "$mirror/"
+  "$root/main.py" "$root/requirements.txt" "$root/README.md" "$root/readme-ko.txt" "$mirror/"
 rsync -a --delete --exclude '__pycache__' "$root/ytscore" "$root/ci" "$root/assets" "$mirror/"
 mkdir -p "$mirror/.github"
 rsync -a --delete "$root/.github/workflows" "$mirror/.github/"
