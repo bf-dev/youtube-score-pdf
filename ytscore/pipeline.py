@@ -577,6 +577,7 @@ class SlotFrame:
     gray: np.ndarray        # polarity-normalised: ink is always DARK here
     key: np.ndarray         # binary signature for dedup
     fp: np.ndarray          # grey fingerprint, same downscale without the threshold
+    hkey: np.ndarray | None = None   # the header band (measure number, marker) on its own
     top: int = -1           # row of this frame's staff, for composite alignment
 
 
@@ -908,6 +909,10 @@ def detect_rolling(group_times: list[list[float]], cores: list[list[np.ndarray]]
     return (0, 1) if f10 > f01 else (1, 0)
 
 
+HEAD_NEW = 0.45             # header this different is a new system on its own
+HEAD_RUN = 3                # ...but only once it has stayed different this many frames
+
+
 def group_lines(frames: list[SlotFrame], thresh: float) -> list[list[SlotFrame]]:
     """
     One group per distinct line, comparing each frame to the running anchor.
@@ -930,14 +935,32 @@ def group_lines(frames: list[SlotFrame], thresh: float) -> list[list[SlotFrame]]
     groups: list[list[SlotFrame]] = []
     anchor: np.ndarray | None = None
     anchor_fp: np.ndarray | None = None
+    anchor_head: np.ndarray | None = None
+    head_run = 0
     for f in frames:
+        # A changed HEADER is a new system on its own evidence. The staff picture
+        # cannot always show it: sample case 0's measures 53-56 and 57-60 are four
+        # bars of rest under one lyric, identical to within two digits, so on the
+        # whole strip they measure 0.02 apart and were printed once instead of
+        # twice. The header band is those two digits plus the section marker at
+        # their own scale, where the same pair measures 0.7.
+        # ...and only when it STAYS changed. A system that is on screen for ten
+        # seconds picks up transients -- the slide-in smear, a highlight box, the
+        # playhead crossing a rest -- and a single frame of those was enough to
+        # print sample case 0's measure 57 three times over.
+        head_run = (head_run + 1) if (anchor_head is not None and f.hkey is not None
+                                      and jaccard(f.hkey, anchor_head) > HEAD_NEW) else 0
+        head_changed = head_run >= HEAD_RUN
         new = (anchor is None
+               or head_changed
                or (jaccard(f.key, anchor) > thresh
                    and soft_jaccard(f.fp, anchor_fp) > thresh))
         if new:
             groups.append([f])
             anchor = f.key.copy()
             anchor_fp = f.fp.copy()
+            anchor_head = None if f.hkey is None else f.hkey.copy()
+            head_run = 0
         else:
             groups[-1].append(f)
             anchor |= f.key
@@ -1339,7 +1362,7 @@ def run(url: str, workdir: Path, outdir: Path, fps: float, dedup_thresh: float,
     targets = [max(0, sp[0] - y0) for sp, (y0, _) in zip(lay.staff_spans, lay.systems)]
     staff_h = [sp[1] - sp[0] for sp in lay.staff_spans]
     up = int(round(4.0 * lay.staff_gap))
-    down = int(round(3.5 * lay.staff_gap))
+    down = int(round(4.0 * lay.staff_gap))
     for t, f in iter_frames(video, fps, lay.width, lay.height):
         nframes += 1
         if nframes % 20 == 0:
@@ -1355,18 +1378,24 @@ def run(url: str, workdir: Path, outdir: Path, fps: float, dedup_thresh: float,
             # empty paper then dominates both distances -- the graded one in
             # particular, whose denominator counts every off-white pixel -- and 777
             # frames of that video collapsed into 8 "systems" instead of ~28.
-            # Anchoring the window on this frame's own staff also absorbs the
-            # 10-20px the display shifts when a line carries lyrics. The window
+            # The window is FIXED at the layout's staff position, not moved to
+            # this frame's own staff: an anchor that occasionally fails and falls
+            # back shifts the crop by tens of pixels between neighbouring frames,
+            # and video 1 then split its 21 systems into 83 groups. The padding
+            # below absorbs the 10-20px a display shifts when a line carries
+            # lyrics; composite_line still registers the frames properly. The window
             # reaches four staff spaces ABOVE the top line on purpose: the
             # measure number and the section marker live there, and they are the
             # only difference between sample case 0's measures 53-56 and 57-60
             # (four bars of rest under the same lyric). At two spaces the two
             # never separated and measure 57 was missing from the PDF.
-            a = max(0, (top if top >= 0 else targets[si]) - up)
-            b = min(g.shape[0], (top if top >= 0 else targets[si]) + staff_h[si] + down)
+            a = max(0, targets[si] - up)
+            b = min(g.shape[0], targets[si] + staff_h[si] + down)
             core = g[a:b] if b - a >= 8 else g
+            hcut = targets[si] - int(round(0.4 * lay.staff_gap))
+            hkey = signature(g[:hcut], HEAD_W, HEAD_H) if hcut >= 6 else None
             raw_slots[si].append(SlotFrame(t=t, gray=g, key=signature(core),
-                                           fp=fingerprint(core), top=top))
+                                           fp=fingerprint(core), hkey=hkey, top=top))
             ridges[si].append(float(prof.max()))
 
     # A frame is a score frame when its staff is actually drawn. The ridge value
