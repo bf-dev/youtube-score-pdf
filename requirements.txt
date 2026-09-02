@@ -5,3 +5,7 @@ numpy>=1.26,<3
 PyMuPDF>=1.24
 yt-dlp>=2026.8.19
 requests>=2.31
+# socks5h support for yt-dlp. The customer never needs it; our own Windows CI
+# does, because both GitHub's and Azure's IPs get "Sign in to confirm you're not
+# a bot" from YouTube and the end-to-end test has to go out through a KR proxy.
+PySocks>=1.7.1
