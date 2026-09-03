@@ -9,8 +9,15 @@ a flag is OURS (CI, diagnostics) and is never part of what they run:
     --guidemo         fill the window in, run a real conversion, hold it for the
                       screenshot; --url=, --title=, --out=, --hold= tune it
     --selftest        headless end-to-end: convert --url= and assert the PDF
+    --scrolltest      the other side of that gate: run --url= and assert the
+                      scroll guard REFUSES it, printing the Korean refusal the
+                      customer would see and failing if a PDF appeared anyway
     --artifacts-test  post one report and print the server's answer
     --console         run one conversion on the console, for a shell on the builder
+    --protection-status
+                      print the copy-protection verdict for this copy, exit 0 when
+                      it would run and 3 when it would refuse. Reports only; it
+                      neither writes a marker nor bypasses one.
 """
 
 from __future__ import annotations
@@ -25,7 +32,7 @@ if getattr(sys, "frozen", False):
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from ytscore import bridge, config, paths          # noqa: E402
+from ytscore import activation, bridge, config, paths          # noqa: E402
 
 
 def _arg(name: str, default: str | None = None) -> str | None:
@@ -57,6 +64,19 @@ def gui_selftest() -> int:
     return 0
 
 
+def protection_status() -> int:
+    """Read-only verdict, for the copied-folder test. Writes nothing, bypasses nothing."""
+    v = activation.check()
+    print(activation.summary(v), flush=True)
+    print(f"exe={sys.executable}", flush=True)
+    print(f"machine_id={activation.machine_id()}", flush=True)
+    print(f"expected_token={activation.expected_token()}", flush=True)
+    print(f"stored_token={activation.stored_token()}", flush=True)
+    print(f"install_record={activation.installed_here()}", flush=True)
+    print("PROTECTION_ALLOW" if v["ok"] else "PROTECTION_REFUSE", flush=True)
+    return 0 if v["ok"] else 3
+
+
 def artifacts_test() -> int:
     r = bridge.send(text="artifacts wire test from the build pipeline",
                     parts={"diagnostics.json": __import__("json").dumps(
@@ -68,11 +88,24 @@ def artifacts_test() -> int:
     return 0 if ok else 1
 
 
+def _gated() -> bool:
+    """True when this copy must not convert anything. Printed, never silent."""
+    v = activation.check()
+    if v["ok"]:
+        return False
+    print(activation.summary(v), flush=True)
+    print(activation.NOTICE, flush=True)
+    return True
+
+
 def selftest() -> int:
     """Headless end-to-end on a real YouTube link, then report the run."""
     import json
     import time
     from ytscore import pipeline
+
+    if _gated():
+        return 3
 
     url = _arg("url") or os.environ.get("YTSCORE_TEST_URL") or "https://youtu.be/2RIsnf--0VY"
     out = Path(_arg("out") or (paths.app_data_dir() / "selftest"))
@@ -114,8 +147,53 @@ def selftest() -> int:
     return 0 if (ok and matched) else 1
 
 
+def scrolltest() -> int:
+    """
+    Prove the scroll guard on the packaged build: this URL must be REFUSED, with
+    the Korean message, and must leave no PDF behind. A guard that only exists
+    in the source tree is not a guard the customer has.
+    """
+    import time
+    from ytscore import pipeline
+    from ytscore.gui import korean_error
+
+    if _gated():
+        return 3
+    url = _arg("url") or "https://youtu.be/rsUfI3EKAj4"
+    out = Path(_arg("out") or (paths.app_data_dir() / "scrolltest"))
+    out.mkdir(parents=True, exist_ok=True)
+    for stale in out.glob("*.pdf"):
+        stale.unlink()
+    lines: list[str] = []
+    pipeline.set_log_sink(lambda s: (lines.append(s), print(s, flush=True)))
+    t0 = time.time()
+    verdict, detail = "no-refusal", ""
+    try:
+        pipeline.run(url=url, workdir=out / "work", outdir=out, fps=4.0,
+                     dedup_thresh=0.30, proxy=os.environ.get("YTSCORE_PROXY") or None,
+                     name="scrolltest", title_override=None, keep_video=False)
+    except pipeline.ScrollingScore as exc:
+        verdict, detail = "refused", str(exc)
+        print(f"guard: {detail}", flush=True)
+        print(korean_error(exc), flush=True)
+    except Exception as exc:                                     # noqa: BLE001
+        verdict, detail = f"wrong-error:{type(exc).__name__}", str(exc)
+        print(f"UNEXPECTED {type(exc).__name__}: {exc}", flush=True)
+    pdfs = sorted(p.name for p in out.glob("*.pdf"))
+    ok = verdict == "refused" and not pdfs
+    print(f"pdfs left behind: {pdfs}", flush=True)
+    bridge.send(text=(f"SCROLLTEST {'OK' if ok else 'FAIL'} url={url} "
+                      f"verdict={verdict} pdfs={pdfs} "
+                      f"elapsed={time.time() - t0:.1f}s\n{detail}"),
+                parts={"run.log": "\n".join(lines)}, tag="scrolltest", blocking=True)
+    print("SCROLLTEST_OK" if ok else "SCROLLTEST_FAIL", flush=True)
+    return 0 if ok else 1
+
+
 def console() -> int:
     from ytscore import pipeline
+    if _gated():
+        return 3
     url = _arg("url") or (sys.argv[1] if len(sys.argv) > 1 else "")
     if not url:
         print("usage: --console --url=<youtube link> [--out=<dir>]")
@@ -151,12 +229,16 @@ def main() -> int:
     if "--version" in argv:
         print(f"{config.APP_SLUG} {config.APP_VERSION} (customer {config.CUSTOMER_ID})")
         return 0
+    if "--protection-status" in argv:
+        return protection_status()
     if "--guiselftest" in argv:
         return gui_selftest()
     if "--artifacts-test" in argv:
         return artifacts_test()
     if "--selftest" in argv:
         return selftest()
+    if "--scrolltest" in argv:
+        return scrolltest()
     if "--console" in argv:
         return console()
 

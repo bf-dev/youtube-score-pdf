@@ -9,10 +9,19 @@
 #   1. uninstall any previous copy, then install from installer\*.exe silently
 #   2. assert the installed tree has the exe, ffmpeg, ffprobe and the font
 #   3. launch the INSTALLED exe in the builder's interactive session 1 with
-#      --guidemo pointed at one of the customer's own acceptance videos, so a
-#      real conversion runs in the real window
+#      --guidemo pointed at TWO of the customer's own acceptance videos, so two
+#      real conversions run back to back in one real window
 #   4. capture that window with PrintWindow while the result is on screen
-#   5. assert the PDF the GUI wrote is a real multi-page PDF
+#   5. assert BOTH PDFs the GUI wrote are real multi-page PDFs
+#
+# Two videos, not one, deliberately: the 1.0.1 work-dir bug (the second
+# conversion was handed the FIRST video) is invisible to any single-conversion
+# test, and a copy-protection change touches the launch path both conversions go
+# through.
+#
+# NOTE: YTSCORE_BUILD_KEY is NOT set anywhere in this script. The installed copy
+# has to pass the protection check on its own installer marker, which is half of
+# what this run proves.
 #
 # Everything comes back into out/installed/.
 set -euo pipefail
@@ -22,15 +31,18 @@ SSH="ssh -o StrictHostKeyChecking=no -o ConnectTimeout=20 $HOST"
 REMOTE='C:\builds\ytscore'
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUT="$ROOT/out/installed"
-# a02-buksunsaeng, one of the ten videos the customer supplied. Deliberately NOT
-# the video ci/winbuilder.sh already converted, so this exercises a fresh
-# download + layout detection rather than replaying a warm case.
-E2E_URL="${E2E_URL:-https://youtu.be/IweNtfTT8PI}"
-E2E_TITLE="${E2E_TITLE:-북선생 드럼악보}"
+# a02-buksunsaeng and a01-drumplace, two of the ten videos the customer supplied.
+# Deliberately NOT the video ci/winbuilder.sh already converted, so this
+# exercises fresh downloads + layout detection rather than replaying a warm case.
+# '|' is split into two lines in the link box by _wire_demo.
+E2E_URL="${E2E_URL:-https://youtu.be/IweNtfTT8PI|https://youtu.be/6PbwedZDFfQ}"
+# No --title: with two links a single fixed title would name both PDFs the same,
+# so each one takes its own YouTube title, exactly as the customer's runs do.
+EXPECT_PDFS=${EXPECT_PDFS:-2}
 PROXY="${YTSCORE_PROXY:-$(head -1 "$HOME/workspace/scripts/proxy-pool/output/proxies.txt")}"
 WINPWD='cho28670!!server'
-SETTLE=${SETTLE:-450}
-HOLD_MS=${HOLD_MS:-900000}
+SETTLE=${SETTLE:-900}
+HOLD_MS=${HOLD_MS:-1500000}
 
 log() { echo "[installed-e2e] $*"; }
 push() {
@@ -74,6 +86,16 @@ foreach (\$f in @(\$exe,
 \$files = Get-ChildItem \$app -Recurse -File
 "installed size: {0:N1} MB, {1} files" -f ((\$files | Measure-Object Length -Sum).Sum / 1MB), \$files.Count
 "installed exe version: \$((Get-Item \$exe).VersionInfo.FileVersion)"
+
+# The installer must have stamped HKCU for THIS machine, and the installed exe
+# must accept that stamp on its own (no CI key is set anywhere in this script).
+\$mark = Get-ItemProperty 'HKCU:\Software\youtube-score-pdf' -ErrorAction SilentlyContinue
+"marker InstallToken: \$(\$mark.InstallToken)"
+"marker InstalledPath: \$(\$mark.InstalledPath)"
+if (-not \$mark.InstallToken) { throw 'the installer wrote no activation marker' }
+\$p = Start-Process \$exe -ArgumentList '--protection-status' -RedirectStandardOutput installed-protection.log -PassThru -Wait
+Get-Content installed-protection.log
+if (\$p.ExitCode -ne 0) { throw "the INSTALLED copy was refused (exit \$(\$p.ExitCode))" }
 PS1
 push /tmp/ytscore-install.ps1 ytscore-install.ps1
 log "installing from the Inno Setup installer"
@@ -111,8 +133,7 @@ Get-Process -Name \$base -ErrorAction SilentlyContinue | Stop-Process -Force
 # title silently truncates. Embed literal quotes with a SINGLE-quoted PS string;
 # PowerShell escapes with a backtick, and a backslash here is a parse error that
 # kills the script before its own try/catch can report it.
-\$demoArgs = @('--guidemo', '--url=$E2E_URL', '"--title=$E2E_TITLE"',
-              "--out=\$dir", '--hold=$HOLD_MS')
+\$demoArgs = @('--guidemo', '--url=$E2E_URL', "--out=\$dir", '--hold=$HOLD_MS')
 Start-Process \$exe -ArgumentList \$demoArgs | Out-Null
 \$hwnd = [IntPtr]::Zero
 for (\$i = 0; \$i -lt 120; \$i++) {
@@ -122,12 +143,11 @@ for (\$i = 0; \$i -lt 120; \$i++) {
   if (\$w) { \$hwnd = \$w.MainWindowHandle; break }
 }
 if (\$hwnd -eq [IntPtr]::Zero) { throw 'the installed app never opened a window' }
-# wait for the conversion, but stop early once the GUI has written its PDF
+# wait for BOTH conversions, but stop early once the GUI has written them
 for (\$i = 0; \$i -lt $SETTLE; \$i++) {
   Start-Sleep -Seconds 1
-  if (\$i -gt 60 -and (Get-ChildItem \$dir -Filter *.pdf -ErrorAction SilentlyContinue)) {
-    Start-Sleep -Seconds 8; break
-  }
+  \$n = @(Get-ChildItem \$dir -Filter *.pdf -ErrorAction SilentlyContinue).Count
+  if (\$i -gt 60 -and \$n -ge $EXPECT_PDFS) { Start-Sleep -Seconds 10; break }
 }
 [Win32Cap2]::ShowWindow(\$hwnd, 5) | Out-Null
 [Win32Cap2]::SetForegroundWindow(\$hwnd) | Out-Null
@@ -148,7 +168,15 @@ for (\$x = 0; \$x -lt \$w; \$x += 7) { for (\$y = 0; \$y -lt \$h; \$y += 7) {
   \$colors[\$bmp.GetPixel(\$x, \$y).ToArgb()] = 1 } }
 Get-Process -Name \$base -ErrorAction SilentlyContinue | Stop-Process -Force
 \$pdfs = @(Get-ChildItem \$dir -Filter *.pdf)
-if (\$pdfs.Count -lt 1) { throw 'the installed GUI produced no PDF' }
+if (\$pdfs.Count -lt $EXPECT_PDFS) {
+  throw "the installed GUI produced \$(\$pdfs.Count) PDFs, expected $EXPECT_PDFS"
+}
+# Two conversions writing the SAME bytes would mean the second run was handed the
+# first video again, which is exactly the 1.0.1 bug this test exists for.
+\$hashes = @(\$pdfs | ForEach-Object { (Get-FileHash \$_.FullName -Algorithm SHA256).Hash })
+if ((\$hashes | Sort-Object -Unique).Count -ne \$pdfs.Count) {
+  throw 'two conversions produced identical PDFs'
+}
 \$out = "captured \${w}x\${h}, \$(\$colors.Count) colours"
 foreach (\$p in \$pdfs) { \$out += "; PDF \$(\$p.Name) \$(\$p.Length) bytes" }
 if (\$colors.Count -lt 12) { \$out = "FAILED blank capture; \$out" }

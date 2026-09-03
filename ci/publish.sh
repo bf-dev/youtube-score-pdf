@@ -61,6 +61,17 @@ if [ -n "$INSTALLER" ]; then
   app_ver=$(python3 -c "import sys; sys.path.insert(0,'.'); from ytscore.config import APP_VERSION; print(APP_VERSION)")
   name="youtube-score-pdf-setup-$app_ver.exe"
   publish "$INSTALLER" "$name"
+  ZIP="out/win/out/youtube-score-pdf-setup-$app_ver.zip"
+  [ -f "$ZIP" ] && publish "$ZIP" "youtube-score-pdf-setup-$app_ver.zip"
+  # Bumping the manifest is a LIVE DEPLOY onto the customer's PC: their running
+  # app polls it hourly and hot-swaps its own exe underneath them. NO_MANIFEST=1
+  # publishes the installer and stops, for when the owner hands the link over by
+  # hand. 1.2.0 shipped exactly that way, because the customer was mid-session
+  # running conversions at the time. Ask before turning it back on.
+  if [ "${NO_MANIFEST:-0}" = "1" ]; then
+    echo "  manifest deliberately NOT bumped (NO_MANIFEST=1)"
+    exit $rc
+  fi
   cat > /tmp/version-ytscore.json <<JSON
 {
   "version": "$app_ver",

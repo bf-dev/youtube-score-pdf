@@ -23,10 +23,24 @@ REMOTE='C:\builds\ytscore'
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUT="$ROOT/out/win"
 E2E_URL="${E2E_URL:-https://youtu.be/638BDPkSpf8}"
+# The customer's horizontally scrolling link. The scroll guard must REFUSE this
+# one, and must still convert E2E_URL above. Both sides run on the packaged exe.
+SCROLL_URL="${SCROLL_URL:-https://youtu.be/rsUfI3EKAj4}"
 PROXY="${YTSCORE_PROXY:-$(head -1 "$HOME/workspace/scripts/proxy-pool/output/proxies.txt")}"
 WINPWD='cho28670!!server'                 # session-1 task account; also in winbuild
+# Copy protection (ytscore/activation.py) refuses any copy that was not put there
+# by the installer, and everything in THIS script runs the un-installed build
+# tree, which is exactly that. Only its sha256 is compiled into the exe
+# (config.BUILD_KEY_SHA256). Never set in ci/installed_e2e.sh or in
+# ci/protection_e2e.sh: those two exist to exercise the check, not to skip it.
+BUILD_KEY='e4f334903a6524ba9c84df09f45b6a66'
 
 log() { echo "[winbuilder] $*"; }
+
+# ---- 0. protection logic, before spending 30 minutes on a build ---------------
+log "activation branch tests"
+python3 "$ROOT/ci/test_activation.py" || { log "activation logic is broken"; exit 1; }
+
 push() {                                  # push <local.ps1> <remote name>
   printf '\xEF\xBB\xBF' | cat - "$1" > "$1.bom"     # PS 5.1 reads .ps1 as ANSI without a BOM
   scp -q -o StrictHostKeyChecking=no "$1.bom" "$HOST:C:/builder/$2"
@@ -50,6 +64,9 @@ cat > /tmp/ytscore-build.ps1 <<PS1
 \$ErrorActionPreference = 'Stop'
 \$py = 'C:\Program Files\Python312\python.exe'
 Set-Location '$REMOTE'
+# The build tree was not put here by the installer, so without this every mode
+# below would (correctly) refuse. See the note on BUILD_KEY in this script.
+\$env:YTSCORE_BUILD_KEY = '$BUILD_KEY'
 & \$py -m pip install -q --upgrade pip
 & \$py -m pip install -q -r requirements.txt pyinstaller
 powershell -ExecutionPolicy Bypass -File ci\fetch_ffmpeg.ps1
@@ -79,6 +96,23 @@ foreach (\$mode in @('--version', '--guiselftest')) {
   "\$mode -> exit \$(\$p.ExitCode)"
   if (\$p.ExitCode -ne 0) { throw "\$mode failed" }
 }
+
+# Copy protection, both directions, on the build tree (which the installer never
+# touched). With the CI key it must allow; with the key removed the very same exe
+# in the very same folder must refuse with exit 3. That is the whole mechanism in
+# two lines, ~15 seconds, before anything expensive runs.
+\$p = Start-Process \$exe.FullName -ArgumentList '--protection-status' \`
+     -RedirectStandardOutput protection-allow.log -PassThru -Wait
+Get-Content protection-allow.log
+if (\$p.ExitCode -ne 0) { throw 'protection refused a run that carried the CI key' }
+\$saved = \$env:YTSCORE_BUILD_KEY
+\$env:YTSCORE_BUILD_KEY = ''
+\$p = Start-Process \$exe.FullName -ArgumentList '--protection-status' \`
+     -RedirectStandardOutput protection-refuse.log -PassThru -Wait
+Get-Content protection-refuse.log
+\$env:YTSCORE_BUILD_KEY = \$saved
+if (\$p.ExitCode -ne 3) { throw "an uninstalled copy was allowed to run (exit \$(\$p.ExitCode))" }
+
 \$p = Start-Process \$exe.FullName -ArgumentList '--artifacts-test' -RedirectStandardOutput artifacts.log -PassThru -Wait
 Get-Content artifacts.log
 if (\$p.ExitCode -ne 0) { throw 'artifacts reporter did not land' }
@@ -93,7 +127,18 @@ if (\$p.ExitCode -ne 0) { throw 'end-to-end conversion failed' }
 "E2E PDF: {0:N0} bytes" -f \$pdf.Length
 if (\$pdf.Length -lt 100000) { throw 'PDF too small to be real' }
 
-\$iscc = "\${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+# The scroll guard, on the packaged exe, both directions. The step above is the
+# negative side (a normal video still converts); this is the positive one: the
+# customer's horizontally scrolling link must be REFUSED with the Korean notice
+# and must leave no PDF behind. See pipeline.ScrollingScore.
+Remove-Item -Recurse -Force scrolltest -ErrorAction SilentlyContinue
+\$p = Start-Process \$exe.FullName -ArgumentList '--scrolltest','--url=$SCROLL_URL','--out=scrolltest' \`
+     -RedirectStandardOutput scrolltest.log -PassThru -Wait
+Get-Content scrolltest.log -Tail 12
+if (\$p.ExitCode -ne 0) { throw 'the scroll guard did not refuse the scrolling video' }
+if (Get-ChildItem scrolltest\*.pdf -ErrorAction SilentlyContinue) { throw 'a PDF was written for a video the guard refused' }
+
+\$iscc ="\${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
 & \$iscc ci\installer.iss | Select-Object -Last 5
 if (\$LASTEXITCODE -ne 0) { throw 'ISCC failed' }
 # NEWEST, not alphabetically first: installer\ keeps older versions, and
@@ -102,7 +147,9 @@ if (\$LASTEXITCODE -ne 0) { throw 'ISCC failed' }
 "installer: {0}  {1:N1} MB  sha256 {2}" -f \$setup.Name, (\$setup.Length / 1MB), \`
    (Get-FileHash \$setup.FullName -Algorithm SHA256).Hash.ToLower()
 if (\$setup.Length -lt 20MB) { throw 'installer suspiciously small' }
-& \$py ci\package_zip.py dist\youtube-score-pdf out
+# The ZIP wraps the INSTALLER now, not the program folder: an extracted program
+# folder is by definition a copy and the protection would refuse it.
+& \$py ci\package_zip.py \$setup.FullName out
 PS1
 push /tmp/ytscore-build.ps1 ytscore-build.ps1
 log "building (pip, pyinstaller, selftests, real end-to-end, installer)"
@@ -134,6 +181,7 @@ public class Win32Cap {
 New-Item -ItemType Directory -Force -Path \$dir | Out-Null
 Remove-Item "\$dir\gui.png" -ErrorAction SilentlyContinue
 \$env:YTSCORE_PROXY = '$PROXY'
+\$env:YTSCORE_BUILD_KEY = '$BUILD_KEY'
 Set-Location '$REMOTE'
 \$exe = '$REMOTE\dist\youtube-score-pdf\youtube-score-pdf.exe'
 \$base = 'youtube-score-pdf'
@@ -209,7 +257,8 @@ mkdir -p "$OUT"
 $SSH "\$ErrorActionPreference='Stop'
       Set-Location '$REMOTE'
       Remove-Item C:\\builds\\ytscore-out.zip -ErrorAction SilentlyContinue
-      \$items = @('installer','screenshots','out','e2e','selftest.log','artifacts.log') |
+      \$items = @('installer','screenshots','out','e2e','selftest.log','artifacts.log',
+                 'protection-allow.log','protection-refuse.log') |
                 Where-Object { Test-Path \$_ }
       Compress-Archive -Path \$items -DestinationPath C:\\builds\\ytscore-out.zip -Force" > /dev/null
 scp -q -o StrictHostKeyChecking=no "$HOST:C:/builds/ytscore-out.zip" "$OUT/_out.zip"

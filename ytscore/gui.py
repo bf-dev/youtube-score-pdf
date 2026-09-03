@@ -27,8 +27,8 @@ from tkinter import BOTH, END, LEFT, RIGHT, SUNKEN, StringVar, Tk, X, Y, filedia
 from tkinter import ttk
 import tkinter as tk
 
-from ytscore import bridge, config, paths
-from ytscore.pipeline import Cancelled, DownloadFailed, ScoreNotFound
+from ytscore import activation, bridge, config, paths
+from ytscore.pipeline import Cancelled, DownloadFailed, ScoreNotFound, ScrollingScore
 
 BG = "#f4f5f7"
 CARD = "#ffffff"
@@ -90,6 +90,12 @@ def korean_error(exc: BaseException) -> str:
         if "timed out" in m or "connection" in m or "network" in m or "resolve" in m:
             return "인터넷 연결이 불안정해 영상을 내려받지 못했습니다. 잠시 후 다시 시도해 주세요."
         return "영상을 내려받지 못했습니다. 링크가 맞는지, 비공개 영상이 아닌지 확인해 주세요."
+    if isinstance(exc, ScrollingScore):
+        # This one must not be softened into "try again". The video is a
+        # continuously moving ribbon and this version cannot convert it at all,
+        # so the customer needs to know to pick a different video, not to retry.
+        return ("이 영상의 악보는 좌우로 계속 흘러가는 방식이라 변환할 수 없습니다.\n"
+                "악보가 한 화면씩 멈춰서 넘어가는 영상으로 시도해 주세요.")
     if isinstance(exc, ScoreNotFound):
         return "이 영상에서는 악보를 찾지 못했습니다. 악보가 화면에 보이는 영상인지 확인해 주세요."
     msg = str(exc)
@@ -108,6 +114,9 @@ class App:
         self.done_paths: list[Path] = []
         self.demo = demo or {}
         self.session_log: list[str] = []
+        # Copy protection, once per launch. See ytscore/activation.py: this asks
+        # only "did the installer run on this machine", never "how many machines".
+        self.activation = activation.check()
 
         root.title(f"{config.APP_NAME} v{config.APP_VERSION}")
         root.configure(bg=BG)
@@ -134,6 +143,10 @@ class App:
 
         self._build()
         self.root.after(120, self._pump)
+        if not self.activation["ok"]:
+            self._block_ui()
+            self.root.after(600, self._activation_dialog)
+            self._report_blocked()
 
     # ------------------------------------------------------------------ layout
     def _card(self, parent) -> ttk.Frame:
@@ -144,6 +157,20 @@ class App:
     def _build(self) -> None:
         outer = ttk.Frame(self.root, padding=18)
         outer.pack(fill=BOTH, expand=True)
+
+        # Shown only when this copy was never installed on this PC. tk.Frame, not
+        # ttk: a ttk style would have to be themed for one red box that almost no
+        # launch ever paints.
+        if not self.activation["ok"]:
+            warn = tk.Frame(outer, bg="#fdecea", highlightbackground=BAD,
+                            highlightthickness=1)
+            warn.pack(fill=X, pady=(0, 14))
+            tk.Label(warn, text=activation.NOTICE, bg="#fdecea", fg=BAD,
+                     font=_font(12, True), justify=LEFT,
+                     anchor="w").pack(fill=X, padx=14, pady=(12, 4))
+            tk.Label(warn, text=activation.NOTICE_DETAIL, bg="#fdecea", fg=INK,
+                     font=_font(9), justify=LEFT,
+                     anchor="w").pack(fill=X, padx=14, pady=(0, 12))
 
         head = ttk.Frame(outer)
         head.pack(fill=X, pady=(0, 14))
@@ -234,6 +261,38 @@ class App:
                 messagebox.showerror("오류", korean_error(exc))
         return inner
 
+    # -------------------------------------------------------------- protection
+    def _block_ui(self) -> None:
+        """Everything that could start a conversion goes dead. Nothing else does."""
+        try:
+            self.go.configure(state="disabled")
+            self.status.set(activation.NOTICE)
+            self.status_lbl.configure(foreground=BAD)
+            self._append(activation.NOTICE)
+            self._append(activation.NOTICE_DETAIL)
+        except Exception:
+            pass
+
+    def _activation_dialog(self) -> None:
+        try:
+            messagebox.showerror(activation.NOTICE_TITLE,
+                                 f"{activation.NOTICE}\n\n{activation.NOTICE_DETAIL}")
+        except Exception:
+            pass
+
+    def _report_blocked(self) -> None:
+        """Tell us a refusal happened, so a FALSE refusal is visible next turn."""
+        try:
+            v = self.activation
+            bridge.send(text=(f"ACTIVATION BLOCKED state={v['state']} detail={v['detail']}\n"
+                              f"exe={sys.executable}"),
+                        parts={"diagnostics.json": json.dumps(
+                            bridge.diagnostics({"activation": v}),
+                            ensure_ascii=False, indent=2)},
+                        tag="activation")
+        except Exception:
+            pass
+
     def log(self, line: str) -> None:
         self.q.put(("log", line))
 
@@ -290,6 +349,14 @@ class App:
     # ------------------------------------------------------------------ running
     def start(self) -> None:
         if self.worker and self.worker.is_alive():
+            return
+        # Re-checked here, not just at launch: this is the one path that does the
+        # work, so it is the one that has to refuse. --guidemo comes through here
+        # too, which is why the installed-build test really exercises the check.
+        self.activation = activation.check()
+        if not self.activation["ok"]:
+            self._block_ui()
+            self._activation_dialog()
             return
         urls = self.parse_links()
         if not urls:
@@ -426,7 +493,8 @@ class App:
                     {"url": url, "elapsed_sec": round(elapsed, 1),
                      "outdir": self.out_var.get(),
                      "title_field": self.title_var.get(),
-                     "queue_size": len(self.parse_links())}),
+                     "queue_size": len(self.parse_links()),
+                     "activation": self.activation}),
                     ensure_ascii=False, indent=2),
             }
             if result:
@@ -527,7 +595,11 @@ def _wire_demo(root: Tk, app: App, demo: dict) -> None:
     screenshot. Never reachable from the customer's build path.
     """
     if demo.get("url"):
-        app.links.insert("1.0", demo["url"])
+        # '|' separates several links, so one demo run can convert two videos
+        # back to back in ONE session. Consecutive conversions in a single
+        # session are what exposed the 1.0.1 work-dir bug, so the installed
+        # acceptance run uses this rather than two separate launches.
+        app.links.insert("1.0", "\n".join(u for u in demo["url"].split("|") if u.strip()))
     if demo.get("title"):
         app.title_var.set(demo["title"])
     if demo.get("outdir"):

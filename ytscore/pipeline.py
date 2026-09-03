@@ -59,6 +59,21 @@ class DownloadFailed(RuntimeError):
     """yt-dlp could not fetch the video (bad link, private, region-locked...)."""
 
 
+class ScrollingScore(RuntimeError):
+    """
+    The score does not sit still: it is one continuous ribbon travelling
+    sideways past a fixed playhead, so there are no discrete systems to lift.
+
+    This tool composites each system out of the frames in which it is
+    stationary, then dedups the repeats. A horizontally scrolling ribbon has no
+    stationary frames at all, so the dedup INVERTS: neighbouring frames come out
+    as different as frames ten seconds apart, every sampled frame survives as
+    its own "system", and the result is a fat PDF of sliced-up nonsense that
+    used to be reported as a success. Refusing loudly is the only honest answer
+    until the horizontal-mosaic path exists.
+    """
+
+
 _SINK = None            # set by the GUI; None means "print", i.e. our CLI/CI modes
 _CANCEL = None          # threading.Event
 
@@ -662,6 +677,120 @@ def staff_present(gray: np.ndarray) -> float:
     across videos, so the caller thresholds it against this video's own spread.
     """
     return float(staff_row_coverage(gray, "dark_ink").max())
+
+
+# ---------------------------------------------------------------------------
+# Horizontal-scroll detection. See ScrollingScore.
+# ---------------------------------------------------------------------------
+
+def column_ink(gray: np.ndarray) -> np.ndarray:
+    """
+    Per-column ink mass of a polarity-normalised (ink dark) crop.
+
+    A 1-D signature is enough and is what makes the guard affordable: sideways
+    travel is a pure translation of this profile, and collapsing the rows throws
+    away exactly the dimension the motion does not use.
+    """
+    ink = np.clip(200.0 - gray.astype(np.float32), 0.0, None)
+    return ink.sum(axis=0)
+
+
+def _ncc(a: np.ndarray, b: np.ndarray) -> float:
+    """Normalised cross-correlation of two equal-length 1-D windows."""
+    if a.size < 16:
+        return 0.0
+    x = a - a.mean()
+    y = b - b.mean()
+    d = float(np.sqrt(float(x @ x) * float(y @ y)))
+    return float(x @ y) / d if d > 1e-6 else 0.0
+
+
+def best_shift(a: np.ndarray, b: np.ndarray, max_shift: int) -> tuple[int, float, float]:
+    """
+    The integer horizontal shift that best takes profile `a` onto profile `b`.
+
+    Returns (shift, ncc at that shift, ncc at zero shift). Positive means the
+    content moved to the RIGHT between the two frames. Correlation is computed
+    on the overlap only and normalised there, so a large shift is not rewarded
+    for having fewer samples to disagree on.
+    """
+    w = int(min(a.size, b.size))
+    m = int(max(1, min(max_shift, w // 3)))
+    best, bestc = 0, -2.0
+    zero = _ncc(a[:w], b[:w])
+    for s in range(-m, m + 1):
+        if s >= 0:
+            c = _ncc(a[: w - s], b[s:w])
+        else:
+            c = _ncc(a[-s:w], b[: w + s])
+        if c > bestc:
+            best, bestc = s, c
+    return best, bestc, zero
+
+
+# A pair whose best correlation is below this is two frames that simply do not
+# match at any shift (a cut, a fade, a blank), and its "shift" is noise.
+SCROLL_MIN_NCC = 0.55
+# Below this the frame pair is treated as stationary. One pixel of jitter at
+# 1080p is compression noise, not travel.
+SCROLL_STILL_PX = 2
+
+
+def scroll_metrics(profiles: list[np.ndarray], fps: float,
+                   max_pairs: int = 240) -> dict:
+    """
+    How much the content of one slot travels sideways, per consecutive pair of
+    sampled frames. Everything the guard decides on is in here.
+
+        px_per_s          median travel of the matched pairs, in px per second
+        sign_consistency  share of the moving pairs that travel the same way
+        still_frac        share of matched pairs that did not move at all
+        matched           pairs whose best correlation cleared SCROLL_MIN_NCC
+    """
+    n = len(profiles)
+    out = {"pairs": 0, "matched": 0, "px_per_s": 0.0, "sign_consistency": 0.0,
+           "still_frac": 1.0, "median_shift_px": 0.0}
+    if n < 8:
+        return out
+    idx = list(range(n - 1))
+    if len(idx) > max_pairs:                      # sample evenly over the video
+        step = len(idx) / float(max_pairs)
+        idx = [idx[int(i * step)] for i in range(max_pairs)]
+    width = int(profiles[0].size)
+    max_shift = int(max(8, min(0.15 * width, 200)))
+    shifts: list[int] = []
+    for i in idx:
+        s, c, _z = best_shift(profiles[i], profiles[i + 1], max_shift)
+        if c >= SCROLL_MIN_NCC:
+            shifts.append(s)
+    out["pairs"] = len(idx)
+    out["matched"] = len(shifts)
+    if len(shifts) < 8:
+        return out
+    arr = np.asarray(shifts, dtype=np.float32)
+    moving = arr[np.abs(arr) > SCROLL_STILL_PX]
+    out["still_frac"] = float(np.mean(np.abs(arr) <= SCROLL_STILL_PX))
+    out["median_shift_px"] = float(np.median(np.abs(arr)))
+    out["px_per_s"] = float(np.median(np.abs(arr)) * fps)
+    if moving.size:
+        same = max(float(np.mean(moving > 0)), float(np.mean(moving < 0)))
+        out["sign_consistency"] = same
+    return out
+
+
+# The trip conditions, all of which must hold. Calibrated on the ten acceptance
+# videos plus the customer's scrolling one; the measured numbers are in NOTES.md.
+SCROLL_MIN_PX_PER_S = 12.0      # a whole staff space per second, sustained
+SCROLL_MAX_STILL_FRAC = 0.30    # a real score is stationary most of the time
+SCROLL_MIN_SIGN_CONSISTENCY = 0.85
+
+
+def is_scrolling(m: dict) -> bool:
+    """A slot travels sideways continuously, in one direction, and rarely rests."""
+    return (m["matched"] >= 20
+            and m["px_per_s"] >= SCROLL_MIN_PX_PER_S
+            and m["still_frac"] <= SCROLL_MAX_STILL_FRAC
+            and m["sign_consistency"] >= SCROLL_MIN_SIGN_CONSISTENCY)
 
 
 def staff_anchor(prof: np.ndarray, gap: float, target_top: int) -> int:
@@ -1378,6 +1507,10 @@ def run(url: str, workdir: Path, outdir: Path, fps: float, dedup_thresh: float,
     # ---- full-fps pass, cropping only the system boxes
     raw_slots: list[list[SlotFrame]] = [[] for _ in lay.systems]
     ridges: list[list[float]] = [[] for _ in lay.systems]
+    # Per-frame column ink profile, for the scroll guard (see ScrollingScore).
+    # One float per pixel column per frame, so a 3 minute 1080p video costs
+    # ~6MB per slot, which is nothing next to the frames themselves.
+    colprofs: list[list[np.ndarray]] = [[] for _ in lay.systems]
     nframes = 0
     plates = [lay.plate[y0:y1] for y0, y1 in lay.systems]
     targets = [max(0, sp[0] - y0) for sp, (y0, _) in zip(lay.staff_spans, lay.systems)]
@@ -1418,27 +1551,54 @@ def run(url: str, workdir: Path, outdir: Path, fps: float, dedup_thresh: float,
             raw_slots[si].append(SlotFrame(t=t, gray=g, key=signature(core),
                                            fp=fingerprint(core), hkey=hkey, top=top))
             ridges[si].append(float(prof.max()))
+            colprofs[si].append(column_ink(core))
 
     # A frame is a score frame when its staff is actually drawn. The ridge value
     # has no absolute meaning across videos, so the cut is taken against this
     # video's own upper quartile: intro cards, black frames and cutaways sit an
     # order of magnitude below it.
     slots: list[list[SlotFrame]] = []
+    kept_profs: list[list[np.ndarray]] = []
     rejected = 0
     for si, sf in enumerate(raw_slots):
         ref = float(np.percentile(ridges[si], 80)) if sf else 0.0
         cut = 0.35 * ref
-        keep = [f for f, r in zip(sf, ridges[si]) if r >= cut]
+        mask = [r >= cut for r in ridges[si]]
+        keep = [f for f, m in zip(sf, mask) if m]
         rejected += len(sf) - len(keep)
         slots.append(keep)
+        kept_profs.append([p for p, m in zip(colprofs[si], mask) if m])
         log(f"collect: slot {si}: staff ridge ref {ref:.2f}, cut {cut:.2f}, "
             f"{len(keep)}/{len(sf)} frames kept")
     raw_slots = []
+    colprofs = []
     kept = sum(len(s) for s in slots)
     log(f"collect: {nframes} frames x {len(lay.systems)} slot(s) -> {kept} with a staff, "
         f"{rejected} rejected (intro/outro/black/no-staff)")
     if not kept:
         raise ScoreNotFound("no score frames detected")
+
+    # ---- the scroll guard, mechanism 1: measured horizontal travel.
+    # Before anything downstream gets a chance to turn a moving ribbon into 700
+    # "systems" and a 45 page PDF, ask whether the band is standing still. Every
+    # slot that produced a usable verdict has to say "scrolling" before we
+    # refuse: a guard that blocks a working video is worse than the bug.
+    scroll_stats: list[dict] = []
+    for si, ps in enumerate(kept_profs):
+        m = scroll_metrics(ps, fps)
+        m["scrolling"] = is_scrolling(m)
+        scroll_stats.append(m)
+        log(f"scroll: slot {si}: {m['px_per_s']:.1f} px/s, still {m['still_frac']:.2f}, "
+            f"one-way {m['sign_consistency']:.2f}, {m['matched']}/{m['pairs']} pairs "
+            f"-> {'SCROLLING' if m['scrolling'] else 'stationary'}")
+    kept_profs = []
+    voted = [m for m in scroll_stats if m["matched"] >= 20]
+    if voted and all(m["scrolling"] for m in voted):
+        worst = max(voted, key=lambda m: m["px_per_s"])
+        raise ScrollingScore(
+            f"the score band travels {worst['px_per_s']:.0f} px/s sideways "
+            f"({worst['sign_consistency']:.0%} of matched frame pairs move the same "
+            f"way, only {worst['still_frac']:.0%} are stationary)")
 
     # ---- per slot: dedup + composite + render
     chromes: list[np.ndarray | None] = []
@@ -1574,6 +1734,25 @@ def run(url: str, workdir: Path, outdir: Path, fps: float, dedup_thresh: float,
             cleaned.pop(i)
         log(f"order: dropped systems {sorted(bad)} by hand -> {len(cleaned)} systems")
 
+    # ---- the scroll guard, mechanism 2: a sanity bound on the yield.
+    # The travel measurement above is the diagnosis; this is the backstop that
+    # fires on the SYMPTOM, whatever caused it. When dedup stops deduping, the
+    # system count leaves the physically sensible range by an order of
+    # magnitude: the ten acceptance videos run 6-11 systems per minute of video
+    # and turn 700+ frames into 21-42 systems, while the customer's scrolling
+    # link produced 672 systems from 728 frames (a 45 page PDF reported as OK).
+    # Both bounds have to break before this refuses, and both sit ~4x outside
+    # the worst real video, so a genuinely dense score is never caught by it.
+    per_min = len(cleaned) / max(duration / 60.0, 0.1)
+    yield_ratio = len(cleaned) / float(max(kept, 1))
+    log(f"sanity: {len(cleaned)} systems, {per_min:.1f}/min of video, "
+        f"{yield_ratio:.3f} systems per collected frame")
+    if len(cleaned) >= 60 and per_min >= 45.0 and yield_ratio >= 0.35:
+        raise ScrollingScore(
+            f"dedup did not converge: {len(cleaned)} systems out of {kept} "
+            f"collected frames ({per_min:.0f} per minute of video), which is what "
+            f"a continuously moving score looks like")
+
     report(0.88)
     if not title_override and not meta.get("title"):
         # the metadata call can lose a race with YouTube's rate limiter; the
@@ -1602,6 +1781,8 @@ def run(url: str, workdir: Path, outdir: Path, fps: float, dedup_thresh: float,
         "sampled": nframes, "score_frames": kept, "rejected": rejected,
         "candidates": len(candidates), "unsettled_dropped": unsettled,
         "cross_slot_dupes": dropped_dupes, "slot_mode": mode,
+        "scroll": scroll_stats, "systems_per_min": round(per_min, 1),
+        "systems_per_frame": round(yield_ratio, 4),
         "fade_copies_dropped": faded, "redrawn_copies_dropped": repeats,
         "systems": len(cleaned), "dropped_by_hand": sorted(drop_idx or []),
         "video_meta": meta, "duration_sec": round(duration, 1),

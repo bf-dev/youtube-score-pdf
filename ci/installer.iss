@@ -10,7 +10,7 @@
 
 #define AppName "유튜브 악보 PDF 변환기"
 #define AppSlug "youtube-score-pdf"
-#define AppVersion "1.0.2"
+#define AppVersion "1.2.0"
 
 [Setup]
 AppId={{7E5B1C64-3F8A-4C51-9E2D-1775529A0001}
@@ -52,6 +52,50 @@ Source: "dist\{#AppSlug}\*"; DestDir: "{app}"; Flags: recursesubdirs createallsu
 ; ASCII on disk, Korean once installed: a non-ASCII source name did not
 ; survive tar -> Windows on the build VM and ISCC could not find it.
 Source: "readme-ko.txt"; DestDir: "{app}"; DestName: "_읽어주세요.txt"; Flags: ignoreversion
+
+[Registry]
+; Copy protection (ytscore/activation.py). The installer stamps HKCU with a hash
+; of THIS machine's id, outside the install folder on purpose: a marker inside
+; {app} would be copied along with the folder and would prove nothing.
+;
+; This is not a licence and not a seat count. There is no limit on how many PCs
+; run this installer; the only thing a copied folder lacks is a stamp for the
+; machine it was copied to. GetSHA256OfString here and hashlib.sha256 in
+; activation.py were verified to produce the identical digest for the same
+; MachineGuid before this shipped.
+Root: HKCU; Subkey: "Software\{#AppSlug}"; ValueType: string; ValueName: "InstallToken"; ValueData: "{code:InstallToken}"; Flags: uninsdeletevalue
+Root: HKCU; Subkey: "Software\{#AppSlug}"; ValueType: string; ValueName: "InstalledVersion"; ValueData: "{#AppVersion}"; Flags: uninsdeletevalue
+Root: HKCU; Subkey: "Software\{#AppSlug}"; ValueType: string; ValueName: "InstalledPath"; ValueData: "{app}"; Flags: uninsdeletevalue uninsdeletekeyifempty
+
+[Code]
+function MachineId(): String;
+var
+  Guid: String;
+begin
+  Result := '';
+  { HKEY_LOCAL_MACHINE_64: the installer runs 32-bit, and the 32-bit view of
+    this key is a different (or absent) value, so the app and the installer
+    would disagree about what machine this is. }
+  if RegQueryStringValue(HKEY_LOCAL_MACHINE_64,
+       'SOFTWARE\Microsoft\Cryptography', 'MachineGuid', Guid) then
+  begin
+    StringChangeEx(Guid, '{', '', True);
+    StringChangeEx(Guid, '}', '', True);
+    Result := Lowercase(Trim(Guid));
+  end;
+end;
+
+function InstallToken(Param: String): String;
+var
+  Mid: String;
+begin
+  { Empty when MachineGuid cannot be read. The app then falls back to Inno's own
+    uninstall record, so an unreadable id is never a lockout. }
+  Result := '';
+  Mid := MachineId();
+  if Mid <> '' then
+    Result := Lowercase(GetSHA256OfString('ytscore-activation-v1|' + Mid));
+end;
 
 [Icons]
 Name: "{group}\{#AppName}"; Filename: "{app}\{#AppSlug}.exe"
