@@ -97,6 +97,16 @@ foreach (\$mode in @('--version', '--guiselftest')) {
   if (\$p.ExitCode -ne 0) { throw "\$mode failed" }
 }
 
+# The refusal below asks "was this machine ever installed on", and the answer has
+# to come from THIS build, not from whatever a previous lane left on the builder.
+# ci/installed_e2e.sh performs a real install as this same account, so its marker
+# and Inno uninstall record survive into the next build and made the check pass a
+# copy that should have been refused (seen on the 1.3.0 build: state=ok-marker,
+# exit 0, where exit 3 was required). Clear both first. This is our own CI state;
+# installed_e2e re-creates it properly a few minutes later.
+Remove-Item -Path 'HKCU:\Software\youtube-score-pdf' -Recurse -Force -ErrorAction SilentlyContinue
+Remove-Item -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\{7E5B1C64-3F8A-4C51-9E2D-1775529A0001}_is1' -Recurse -Force -ErrorAction SilentlyContinue
+
 # Copy protection, both directions, on the build tree (which the installer never
 # touched). With the CI key it must allow; with the key removed the very same exe
 # in the very same folder must refuse with exit 3. That is the whole mechanism in
@@ -142,7 +152,9 @@ if (Get-ChildItem scrolltest\*.pdf -ErrorAction SilentlyContinue) { throw 'a PDF
 & \$iscc ci\installer.iss | Select-Object -Last 5
 if (\$LASTEXITCODE -ne 0) { throw 'ISCC failed' }
 # NEWEST, not alphabetically first: installer\ keeps older versions, and
-# `Select-Object -First 1` once reinstalled 1.0.0 over a fresh 1.0.1 build.
+# A plain "Select-Object -First 1" once reinstalled 1.0.0 over a fresh 1.0.1
+# build. (No backticks in this comment: the heredoc is unquoted, so bash would
+# run them as a command substitution.)
 \$setup = Get-ChildItem installer\*.exe | Sort-Object LastWriteTime -Descending | Select-Object -First 1
 "installer: {0}  {1:N1} MB  sha256 {2}" -f \$setup.Name, (\$setup.Length / 1MB), \`
    (Get-FileHash \$setup.FullName -Algorithm SHA256).Hash.ToLower()

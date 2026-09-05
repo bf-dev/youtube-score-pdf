@@ -37,6 +37,7 @@ import subprocess
 import sys
 import time
 import unicodedata
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -106,6 +107,34 @@ def log(msg: str) -> None:
         print(line, flush=True)
     except Exception:
         pass        # --noconsole: sys.stdout is None
+
+
+# --------------------------------------------------- 0. writing to the outdir
+
+def imwrite(path: Path | str, img: np.ndarray) -> bool:
+    """
+    `cv2.imwrite`, but through the Python file layer.
+
+    OpenCV opens the destination with a NARROW-char `fopen`, so on Windows the
+    path it is handed (UTF-8 bytes, out of the Python binding) is re-interpreted
+    in the process ANSI code page. An output folder outside that code page --
+    `C:\\Users\\Administrator\\Desktop\\유튜브악보`, which is the folder this
+    customer picked on 2026-09-05 -- therefore writes NOTHING and returns False,
+    with no exception, and the next thing to open that file is what fails. That
+    is what put `FileNotFoundError: No such file: ...\\_page_15624.png` on his
+    screen after seven minutes of work, five runs running.
+
+    Encoding in memory and letting `pathlib` write is exact, not approximate:
+    `imencode` and `imwrite` share the encoder and the default parameters, so
+    the bytes on disk are identical (checked byte-for-byte, colour and grey),
+    and `Path.write_bytes` is wide-char on Windows.
+    """
+    p = Path(path)
+    ok, buf = cv2.imencode(p.suffix or ".png", img)
+    if not ok:
+        return False
+    p.write_bytes(buf.tobytes())
+    return True
 
 
 # ---------------------------------------------------------------- 1. download
@@ -332,6 +361,17 @@ class Layout:
     staff_rows: list[list[int]] = field(default_factory=list)      # line centres per system
     plate: np.ndarray | None = None     # per-pixel background estimate, full frame
     ridge_ref: float = 0.0              # staff-line ridge strength on the median frame
+    # The rows actually SLICED out of each frame. `systems` stays the detection
+    # layout (it is what the scroll band, the run report and the --slots picker
+    # mean); `crops` may reach further out to cover a video that re-lays its
+    # score out from screen to screen, and may overlap its neighbour. Everything
+    # downstream that has to keep comparing the same pixels across videos is
+    # offset by `crop_pad` instead of being re-measured in the wider box.
+    crops: list[tuple[int, int]] = field(default_factory=list)
+    crop_pad: list[tuple[int, int]] = field(default_factory=list)  # (top, bottom) grown
+
+    def crop_boxes(self) -> list[tuple[int, int]]:
+        return self.crops if self.crops else list(self.systems)
 
 
 def _runs(mask: np.ndarray) -> list[tuple[int, int]]:
@@ -385,9 +425,18 @@ def staff_row_coverage(gray: np.ndarray, polarity: str) -> np.ndarray:
     return staff_ridge(gray, polarity).mean(axis=1)
 
 
-def frame_staff_clusters(prof: np.ndarray, h: int) -> tuple[list[list[int]], float]:
-    """One frame's staff lines, grouped into systems. Returns (clusters, spacing)."""
-    line_runs = [r for r in _runs(prof > 0.40) if r[1] - r[0] <= max(6, h // 90)]
+def frame_staff_clusters(prof: np.ndarray, h: int,
+                         thresh: float = 0.40) -> tuple[list[list[int]], float]:
+    """
+    One frame's staff lines, grouped into systems. Returns (clusters, spacing).
+
+    `thresh` is the share of the frame width a ridge has to cover. The default
+    0.40 is what the layout pass uses and must not move. The vertical-scroll
+    layout lowers it, because a score's FINAL system is often only two bars wide
+    (H_uW2B5A1kE ends on a 2 bar tag covering 0.35 of the width) and would
+    otherwise be dropped off the end of the PDF.
+    """
+    line_runs = [r for r in _runs(prof > thresh) if r[1] - r[0] <= max(6, h // 90)]
     centres = [int(round((a + b - 1) / 2)) for a, b in line_runs]
     if not centres:
         return [], 0.0
@@ -401,6 +450,152 @@ def frame_staff_clusters(prof: np.ndarray, h: int) -> tuple[list[list[int]], flo
         else:
             clusters[-1].append(c)
     return clusters, gap
+
+
+# Gates for deink_plate. Calibrated on the three light_ink videos we have; see
+# that function's docstring for the measured numbers behind each one.
+INK_PLATE_LEVEL = 235       # a plate value this bright kills the alpha outright
+PLATE_CLEAN_MIN = 6         # frames of real background needed to replace it
+PLATE_MIN_CHANGE = 60       # grey levels; below this the correction is noise
+PLATE_BLOB_MIN_PX = 40      # saturated px a blob needs before it counts as a glyph
+PLATE_BLOB_FRACTION = 0.25  # ... and the share of the blob they have to be
+
+# A staff group whose own lines sit closer together than this share of the staff
+# spacing is a beam row, not a staff. See the beam-row guard in analyse_layout;
+# measured 0.93-1.00 for every real staff in the corpus, 0.25 for the beam row.
+STAFF_PITCH_MIN_RATIO = 0.5
+
+# Gates for the coloured-notehead rescue in normalise_ink. A saturated glyph
+# small enough to be a notehead and DARK in luma is ink, not chrome.
+CHROME_HEAD_MAX_GAPS = 1.8  # a rescued blob is at most this many staff spaces
+CHROME_HEAD_MAX_LUMA = 140  # ... and darker than this (a highlight is brighter)
+CHROME_HEAD_MIN_AREA = 0.15  # ... and at least this share of gap^2, so noise stays
+
+
+def _odd(n: float, lo: int = 3) -> int:
+    k = max(lo, int(round(n)))
+    return k if k % 2 else k + 1
+
+
+def plate_ink_blobs(plate: np.ndarray, gap: float,
+                    lift: int = 60) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Where a light-ink background plate has NOTATION baked into it, and what the
+    background around that notation looks like.
+
+    Returns (mask, envelope). `envelope` is a grey opening of the plate with a
+    kernel wider than any glyph, i.e. the local dark background the notation is
+    sitting on. `mask` is the notehead-sized bright blobs standing `lift` grey
+    levels or more above it.
+
+    Only BLOBS. A first opening with a kernel about half a staff space wide
+    deletes every thin structure (staff lines are ~2px, barlines ~2px, stems
+    3-4px, beams a few px thick) and keeps only things that are thick in both
+    directions, which for a score means noteheads. Staff lines and barlines are
+    deliberately left in the plate: the alpha recovery cancelling them and
+    `static_chrome` putting them back is the calibrated behaviour of eleven
+    verified videos, and this defect has nothing to do with it.
+    """
+    thick = cv2.morphologyEx(
+        plate, cv2.MORPH_OPEN,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (_odd(0.45 * gap), _odd(0.45 * gap))))
+    kb = _odd(2.4 * gap, 9)
+    env = cv2.morphologyEx(plate, cv2.MORPH_OPEN,
+                           cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kb, kb)))
+    m = (thick.astype(np.int16) - env.astype(np.int16)) > lift
+    # grow back over the anti-aliased rim the first opening ate
+    m = cv2.dilate(m.astype(np.uint8),
+                   cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                             (_odd(0.55 * gap), _odd(0.55 * gap)))) > 0
+    return m, env
+
+
+def deink_plate(stack: np.ndarray, plate: np.ndarray, gap: float, q: int) -> np.ndarray:
+    """
+    Take the notation back out of a light-ink background plate.
+
+    The plate is meant to be "the value each pixel takes when NO notation is on
+    it", and a flat low percentile only delivers that if notation covers a pixel
+    for less than (100-q)% of the video. On a repetitive groove it does not.
+    Measured on `G1J0ZLF8fI8` (the customer's 검정치마 Ling Ling chart): every
+    system is the same four-bar backbeat, the engraver puts the bar-1 snare head
+    on the SAME pixel every time, and that pixel is brighter than 200 in **96%**
+    of the layout frames. So p5=253, p10=255, p15=255: no choice of q helps.
+    `normalise_ink` then computes a = (255 - 255) / 30 = 0 and erases the inside
+    of the head, leaving only the rim where the heads of different systems did
+    not all overlap. That rim is the hollow ring / one-sided crescent the
+    customer photographed, and it is produced by a SINGLE frame, before anything
+    is composited: the misregistered-median theory is not what this is.
+
+    Fixing it per pixel rather than per frame: at the flagged pixels, take the
+    same percentile over only the frames whose value there is nearer the local
+    background than the glyph. A pixel that is ink in 96% of frames still has
+    4% of real background to measure, and the flagged set is a few thousand
+    pixels, so this costs nothing.
+
+    Three gates decide whether a flagged pixel is actually corrected, and they
+    exist because case 3 forced them. That video is white ink over a STATIC
+    studio shot, so the plate legitimately contains bright drum hardware, a
+    plant pot and a poster, all of them blob-shaped. Correcting the raw blob
+    mask moved 106,819 px of its score band by a median of 116 grey levels,
+    which would have printed the drum kit onto the customer's page:
+
+      * `peak >= 235`  - the plate is at the saturated ink level, which is the
+        only value that actually kills the alpha: a = (255-255)/30 = 0. Case 3's
+        background highlights sit at a median of 114.
+      * `n_clean >= 6` - we must have SEEN the background at this pixel. A
+        static bright object never goes dark, so it has nothing to correct with.
+      * `change >= 60` - the correction has to be worth making.
+
+    Together they take case 3 from 106,819 px down to 469 (0.09% of its band)
+    while keeping all 1,761 px of G1J0ZLF8fI8's baked-in noteheads.
+
+    A pixel that fails a gate keeps its plate value. There is deliberately no
+    spatial fallback: substituting the local envelope wherever the plate looks
+    bright is exactly the thing that would repaint case 3's studio onto the page.
+
+    Deliberately narrow. Nothing outside the flagged blobs is touched, and the
+    whole function is light_ink only, so the twelve dark_ink videos in the
+    acceptance set cannot move.
+    """
+    m, env = plate_ink_blobs(plate, gap)
+    if not m.any():
+        return plate
+    ys, xs = np.nonzero(m)
+    cols = stack[:, ys, xs].astype(np.int16)            # (N, M)
+    base = env[ys, xs].astype(np.int16)
+    peak = plate[ys, xs].astype(np.int16)
+    cut = base + np.maximum(((peak - base) * 0.35).astype(np.int16), 12)
+    clean = cols < cut[None, :]
+    n_clean = clean.sum(axis=0)
+    srt = np.sort(np.where(clean, cols, 255), axis=0)   # dirty samples to the top
+    idx = np.clip(((q / 100.0) * np.maximum(n_clean - 1, 0)).astype(np.int64),
+                  0, cols.shape[0] - 1)
+    val = np.take_along_axis(srt, idx[None, :], axis=0)[0]
+    hot = (peak >= INK_PLATE_LEVEL) & (n_clean >= PLATE_CLEAN_MIN) \
+        & ((peak - val) >= PLATE_MIN_CHANGE)
+    # Decide per GLYPH, not per pixel. A notehead's anti-aliased rim sits at
+    # 150-230 and fails the saturation gate, so a per-pixel decision hollows the
+    # head out of the plate and leaves a bright outline that still erases the
+    # edge of every note. A blob is accepted whole when enough of its own body
+    # is saturated ink, which also keeps case 3 safe for free: its background
+    # blobs are large and only a few hundred scattered pixels in them are ever
+    # that bright, so the fraction test throws every one of them out.
+    n_cc, lab = cv2.connectedComponents(m.astype(np.uint8), 8)
+    comp = lab[ys, xs]
+    tot = np.bincount(comp, minlength=n_cc).astype(np.float64)
+    good = np.bincount(comp, weights=hot.astype(np.float64), minlength=n_cc)
+    ok = (good >= PLATE_BLOB_MIN_PX) & (good >= PLATE_BLOB_FRACTION * np.maximum(tot, 1))
+    take = ok[comp] & (n_clean >= PLATE_CLEAN_MIN) & (val < peak)
+    if not take.any():
+        log("analyse: plate carries no baked-in notation")
+        return plate
+    out = plate.copy()
+    out[ys[take], xs[take]] = val[take].astype(np.uint8)
+    log(f"analyse: plate de-inked, {int(ok.sum()) - int(ok[0])} glyph(s) / "
+        f"{int(take.sum())} px of baked-in notation removed from {int(m.sum())} "
+        f"flagged (median drop {float(np.median((peak - val)[take])):.0f} grey levels)")
+    return out
 
 
 def analyse_layout(video: Path, max_frames: int = 140, dump: Path | None = None,
@@ -450,6 +645,14 @@ def analyse_layout(video: Path, max_frames: int = 140, dump: Path | None = None,
     spans = [(int(np.median([c[i][0] for c, _ in usable])),
               int(np.median([c[i][-1] for c, _ in usable]))) for i in range(modal)]
     nlines = [int(np.median([len(c[i]) for c, _ in usable])) for i in range(modal)]
+    # How far apart this group's own lines sit. A staff's lines are one staff
+    # space apart by definition, so this lands on `gap`; a beam row is two
+    # ridges a few px apart and lands far below it. See the beam-row guard.
+    pitches: list[float] = []
+    for i in range(modal):
+        cl = [c[i] for c, _ in usable]
+        per = [float(np.median(np.diff(c))) for c in cl if len(c) >= 2]
+        pitches.append(float(np.median(per)) if per else 0.0)
     log(f"analyse: modal layout = {modal} staff group(s) in {len(usable)}/{len(grays)} frames, "
         f"line spacing {gap:.1f}px, groups {spans} with {nlines} line(s)")
 
@@ -469,6 +672,39 @@ def analyse_layout(video: Path, max_frames: int = 140, dump: Path | None = None,
             f"{max(nlines)}-line staff")
         spans = [spans[i] for i in keep_multi]
         nlines = [nlines[i] for i in keep_multi]
+        pitches = [pitches[i] for i in keep_multi]
+
+    # A BEAM ROW is not a staff, even though it has two lines.
+    #
+    # The customer's LtNIc3oinEs draws its eighth notes with beams that run most
+    # of the width, and the ridge detector reads the beam and its shadow as a
+    # 2-line "staff group" at rows 878..882 -- 4px apart, against this video's
+    # real 16px staff spacing. That phantom group was promoted to its own slot,
+    # which forced the overlap split at y=908 straight THROUGH the one real
+    # system: the beams and accents above the staff were cut off (every eighth
+    # note printed as a bare stem) and the measure number below it was sliced in
+    # half. Nineteen of the phantom slot's twenty candidates were then dropped as
+    # mid-animation, because a beam row has no staff coverage to speak of.
+    #
+    # A staff's lines are one staff space apart by construction, so its internal
+    # pitch IS `gap`. Measured over all 21 cached videos (`src/diag_group_pitch.py`,
+    # out/diag2/pitch.tsv): every group with 2+ lines that is a real staff sits at
+    # ratio 0.93-1.00, and this beam row is the only thing in the corpus below it,
+    # at 0.25. The cut at 0.5 sits in an empty gap, not on a knife edge.
+    #
+    # Single-rule groups keep their own guard above; a genuine one-line rhythm
+    # staff has no internal pitch to measure and is not touched here.
+    if len(spans) >= 2:
+        real = [i for i, p in enumerate(pitches)
+                if nlines[i] < 2 or p >= STAFF_PITCH_MIN_RATIO * gap]
+        if real and len(real) < len(spans):
+            log(f"analyse: dropping beam-row group(s) "
+                f"{[spans[i] for i in range(len(spans)) if i not in real]} "
+                f"(line pitch {[round(pitches[i], 1) for i in range(len(spans)) if i not in real]}px "
+                f"against a {gap:.1f}px staff spacing)")
+            spans = [spans[i] for i in real]
+            nlines = [nlines[i] for i in real]
+            pitches = [pitches[i] for i in real]
 
     # keep only the groups whose content changes: a score does, a title-card rule
     # or a UI border does not. The probe is restricted to the COLUMNS the ridge
@@ -570,9 +806,67 @@ def analyse_layout(video: Path, max_frames: int = 140, dump: Path | None = None,
     spans = [spans[i] for i in tall]
     nlines = [nlines[i] for i in tall]
 
+    # ---- how far the score actually MOVES between screens.
+    # `spans` is one modal layout for the whole video, but a video is free to
+    # re-lay its score out from screen to screen: the customer's zDG0Tw7MDXg
+    # holds four systems at a time and repositions all four on every screen, so
+    # its staffs sit at 350..429 / 542..612 / 718..804 / 911..996 across six
+    # different layouts. A box cut for the modal phase then clips the measure
+    # number off its own system at the top and swallows the beam row of the NEXT
+    # system at the bottom, which is what put a sliced repeat of bar 57 on both
+    # sides of a page break in the delivered PDF.
+    #
+    # So the box is only the DETECTION window; the rows actually sliced out are
+    # grown to cover every phase the video was seen in. Overlapping a neighbour
+    # is fine and expected here, because `trim_system` cuts each finished
+    # composite back to its own system at the measured ink-free line.
+    # Only a TILED layout is grown. A single-slot video has no neighbouring
+    # system in the frame to straddle into, its box is already cut generously
+    # around the one staff, and the same measurement on acceptance video 6 (whose
+    # score fades out and whose "staff" detections wander onto the video image
+    # behind it) grew the slice by 68px of city skyline, diluted the staff
+    # coverage every strip is judged on, and let eleven fade ghosts through.
+    crops: list[tuple[int, int]] = list(boxes)
+    crop_pad: list[tuple[int, int]] = [(0, 0)] * len(boxes)
+    pitch_all = float(np.median(np.diff([s[0] for s in spans]))) if len(spans) >= 2 else 0.0
+    grow_cap = int(round(0.5 * pitch_all))
+    for i, ((y0, y1), (s0, s1)) in enumerate(zip(boxes, spans) if len(spans) >= 2 else []):
+        mid, half = (s0 + s1) / 2.0, (pitch_all / 2.0 if pitch_all > 0 else 4.0 * gap)
+        tops = [c[0] for cl, _ in per_frame for c in cl
+                if len(c) >= 2 and abs((c[0] + c[-1]) / 2.0 - mid) < half]
+        bots = [c[-1] for cl, _ in per_frame for c in cl
+                if len(c) >= 2 and abs((c[0] + c[-1]) / 2.0 - mid) < half]
+        if len(tops) >= 8:
+            lo = int(round(float(np.percentile(tops, 2))))
+            hi = int(round(float(np.percentile(bots, 98))))
+        else:
+            lo, hi = s0, s1
+        # A staff that WANDERS further than most of a pitch is not a page that
+        # was re-laid-out into a few phases, it is a page in motion, and the
+        # vertical-scroll path re-reads the video for those anyway. Growing the
+        # crop to cover the whole sweep would only cost memory: on H_uW2B5A1kE
+        # it took the slice from 215px to 395px per slot, and the frames are
+        # held in RAM on the customer's own PC.
+        sweep = float(np.percentile(tops, 98) - np.percentile(tops, 2)) \
+            if len(tops) >= 8 else 0.0
+        if pitch_all > 0 and sweep > 0.75 * pitch_all:
+            log(f"analyse: slot {i} staff sweeps {sweep:.0f}px of a {pitch_all:.0f}px "
+                f"pitch: a moving page, not a re-layout -> crop left at the box")
+            lo, hi = s0, s1
+        up_grow = int(min(max(s0 - lo, 0), grow_cap))
+        dn_grow = int(min(max(hi - s1, 0), grow_cap))
+        c0, c1 = max(0, y0 - up_grow), min(h, y1 + dn_grow)
+        crops[i] = (c0, c1)
+        crop_pad[i] = (y0 - c0, c1 - y1)
+        if up_grow or dn_grow:
+            log(f"analyse: slot {i} staff moves {lo}..{hi} across screens "
+                f"(modal {s0}..{s1}) -> crop {c0}..{c1}, box {y0}..{y1}")
+
     if force_band is not None:                    # hand-set band overrides detection
         by0, by1 = force_band
         boxes = [(by0, by1)]
+        crops = [(by0, by1)]
+        crop_pad = [(0, 0)]
         spans = [max(spans, key=lambda s: (by0 <= (s[0] + s[1]) // 2 < by1, -abs(s[0] - by0)))]
         nlines = nlines[:1]
         log(f"analyse: band overridden by hand -> {boxes}")
@@ -583,6 +877,8 @@ def analyse_layout(video: Path, max_frames: int = 140, dump: Path | None = None,
     # black ink.
     q = 15 if polarity == "light_ink" else 85
     plate = np.percentile(stack, q, axis=0).astype(np.uint8)
+    if polarity == "light_ink":
+        plate = deink_plate(stack, plate, gap, q)
     med = np.median(stack, axis=0).astype(np.uint8)
 
     staff_rows = []
@@ -591,7 +887,7 @@ def analyse_layout(video: Path, max_frames: int = 140, dump: Path | None = None,
 
     lay = Layout(polarity=polarity, width=w, height=h, staff_gap=gap, systems=boxes,
                  staff_spans=spans, staff_rows=staff_rows,
-                 plate=plate, ridge_ref=0.0)
+                 plate=plate, ridge_ref=0.0, crops=crops, crop_pad=crop_pad)
 
     if dump is not None:
         dump.mkdir(parents=True, exist_ok=True)
@@ -599,8 +895,8 @@ def analyse_layout(video: Path, max_frames: int = 140, dump: Path | None = None,
         for (y0, y1), (s0, s1) in zip(boxes, spans):
             cv2.rectangle(vis, (2, y0), (w - 3, y1 - 1), (0, 0, 255), 3)
             cv2.rectangle(vis, (2, s0), (w - 3, s1), (255, 0, 0), 1)
-        cv2.imwrite(str(dump / "layout.png"), vis)
-        cv2.imwrite(str(dump / "plate.png"), plate)
+        imwrite(dump / "layout.png", vis)
+        imwrite(dump / "plate.png", plate)
         log(f"analyse: dumped {dump/'layout.png'}")
     return lay
 
@@ -615,6 +911,8 @@ class SlotFrame:
     fp: np.ndarray          # grey fingerprint, same downscale without the threshold
     hkey: np.ndarray | None = None   # the header band (measure number, marker) on its own
     top: int = -1           # row of this frame's staff, for composite alignment
+    travelling: bool = False    # the page was sliding past when this frame was taken
+    phx: float = -1.0       # playhead column across the staff, 0..1 (-1 = none seen)
 
 
 def playhead_mask(bgr: np.ndarray, sat_thresh: int, min_value: int = 0) -> np.ndarray:
@@ -638,15 +936,131 @@ def playhead_mask(bgr: np.ndarray, sat_thresh: int, min_value: int = 0) -> np.nd
     return m
 
 
+PLAY_TALL = 0.80        # a playhead covers this share of the staff's height
+PLAY_BACK = 0.35        # ...and a jump back this far across it is the next system
+PLAY_SEEN = 0.80        # only trust the track when this share of frames carry one
+
+
+def playhead_x(bgr: np.ndarray, sat_thresh: int, polarity: str) -> float:
+    """
+    Where the playhead is across the staff, 0..1, or -1 when none is visible.
+
+    `bgr` must be cropped to the STAFF ROWS, not to the slot box. On
+    `d3t9j6DObN0` the box below the staff carries a dark red photograph that is
+    saturated over its whole width, so measured over the full box the chrome
+    centroid sits at a constant 0.41 and the playhead is invisible; measured
+    over the staff rows alone the same frames give a clean sawtooth, 0.05 to
+    0.88 and back, stepping +0.029 per sample.
+
+    Only columns the chrome covers TOP TO BOTTOM count. That is what separates a
+    playhead from everything else saturated in the band: a coloured notehead is
+    a fifth of the staff's height, a highlighted lyric sits under it, and a
+    coloured background covers the staff lines but not the gaps between them.
+    """
+    m = playhead_mask(bgr, sat_thresh, 140 if polarity == "dark_ink" else 0)
+    if not m.any():
+        return -1.0
+    h, w = m.shape
+    tall = m.sum(axis=0) >= PLAY_TALL * h
+    if not tall.any() or w == 0:
+        return -1.0
+    return float(np.flatnonzero(tall).mean()) / w
+
+
+def playhead_resets(frames: list[SlotFrame]) -> set[int]:
+    """
+    The frame indices at which the playhead jumped back to the left margin.
+
+    This is the axis picture similarity cannot have. `group_lines` asks what a
+    frame LOOKS like, and three of the customer's videos defeat that on purpose
+    by engraving the same groove for four or five systems running: on
+    `d3t9j6DObN0` the five screens from t=151.8s to t=191.5s collapse into ONE
+    group of 160 frames (every other content group on that video holds exactly
+    32), so four whole systems never became candidates and were silently missing
+    from his PDF. Their distances against the running anchor are 0.19-0.28
+    binary and 0.21-0.37 graded, against a 0.30 cut that has to stay where it is
+    (below it, sample case 0's cymbal splits one system into nine).
+
+    A playhead does not care what the notation looks like. It sweeps left to
+    right across the system that is sounding and jumps back to the left margin
+    when the next one starts, so it separates two identical systems as easily as
+    two different ones. Measured on that same window: +0.029 per sample forward,
+    -0.89 at each of the eight resets. There is nothing in between.
+
+    The track is only trusted when the playhead is actually visible in
+    PLAY_SEEN of the slot's frames. A video with no playhead, or one whose
+    highlight is too pale to see (`KsSlNq-ciko` draws a light blue box at
+    saturation 30-40, under the pipeline's 50 cut), gets an empty set and the
+    picture rule decides alone, exactly as before.
+    """
+    if not frames:
+        return set()
+    seen = sum(1 for f in frames if f.phx >= 0.0)
+    if seen < PLAY_SEEN * len(frames):
+        return set()
+    out: set[int] = set()
+    prev = -1.0
+    for i, f in enumerate(frames):
+        if f.phx < 0.0:
+            continue
+        if prev >= 0.0 and f.phx - prev <= -PLAY_BACK:
+            out.add(i)
+        prev = f.phx
+    return out
+
+
+def coloured_heads(bgr: np.ndarray, chrome: np.ndarray, gap: float) -> np.ndarray:
+    """
+    The pixels of `chrome` that are actually COLOURED NOTATION, not overlay chrome.
+
+    The customer's umZcjiNpEOw prints its crash cymbals as red X noteheads. Red
+    is the worst case for the brightness gate in `playhead_mask`, because HSV V
+    is max(B,G,R): a red head measures V=196 and passes "bright chrome" while its
+    LUMA is only 96, i.e. it is plainly dark ink on white paper. 77-84% of every
+    red head was being whitened away, so the PDF printed a pair of dash
+    fragments where the X should be. That is the "coloured noteheads are not
+    recognised" the customer reported.
+
+    Two properties separate a coloured head from a translucent playhead, and both
+    are needed (measured per connected component over the cached corpus):
+
+    * SIZE. A head is at most a couple of staff spaces across. The real
+      playheads in the corpus are nothing like it: a01 is a 6x164 column, case3's
+      saturated background runs 626x94.
+    * LUMA. A translucent highlight LIGHTENS the paper it covers, so it stays
+      bright (a01's playhead measures luma 146-164). Ink is dark whatever its
+      hue (the red heads measure 78-104).
+
+    Deciding per connected component rather than per pixel is what keeps a head
+    whole: its anti-aliased rim is neither as dark nor as saturated as its core,
+    and a per-pixel rule hollows the head out exactly like the 1.4.0 plate bug.
+    """
+    n, lab, stats, _ = cv2.connectedComponentsWithStats(chrome.astype(np.uint8), 8)
+    if n <= 1:
+        return np.zeros_like(chrome)
+    luma = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    lim = max(4.0, CHROME_HEAD_MAX_GAPS * gap)
+    min_area = max(8.0, CHROME_HEAD_MIN_AREA * gap * gap)
+    keep = np.zeros(n, bool)
+    for i in range(1, n):
+        w = stats[i, cv2.CC_STAT_WIDTH]
+        h = stats[i, cv2.CC_STAT_HEIGHT]
+        if w > lim or h > lim or stats[i, cv2.CC_STAT_AREA] < min_area:
+            continue
+        keep[i] = float(np.median(luma[lab == i])) < CHROME_HEAD_MAX_LUMA
+    return keep[lab]
+
+
 def normalise_ink(bgr: np.ndarray, plate: np.ndarray, polarity: str,
-                  sat_thresh: int) -> np.ndarray:
+                  sat_thresh: int, gap: float = 0.0) -> np.ndarray:
     """
     Turn one cropped system into an image where the ink is dark and the paper light,
     whatever the source looked like.
 
     dark_ink : the band really is paper. Whiten the saturated playhead and keep
                the grey levels; the group median downstream restores what the
-               playhead covered.
+               playhead covered. Coloured NOTEHEADS are spared (see
+               `coloured_heads`); they are saturated too, but they are ink.
     light_ink: the ink is white and the "paper" is whatever the video happens to
                show. Recover the compositing alpha against the background plate,
                a = (pixel - bg) / (255 - bg), which is flat in the ink and zero in
@@ -657,6 +1071,8 @@ def normalise_ink(bgr: np.ndarray, plate: np.ndarray, polarity: str,
     # notation (whose hue is numerical noise) gets whitened away with it.
     sat = playhead_mask(bgr, sat_thresh, 140 if polarity == "dark_ink" else 0)
     if polarity == "dark_ink":
+        if gap > 0 and sat.any():
+            sat = sat & ~coloured_heads(bgr, sat, gap)
         out = g.copy()
         out[sat] = 255
         return out
@@ -705,17 +1121,36 @@ def _ncc(a: np.ndarray, b: np.ndarray) -> float:
     return float(x @ y) / d if d > 1e-6 else 0.0
 
 
-def best_shift(a: np.ndarray, b: np.ndarray, max_shift: int) -> tuple[int, float, float]:
+def row_ink(gray: np.ndarray) -> np.ndarray:
     """
-    The integer horizontal shift that best takes profile `a` onto profile `b`.
+    Per-ROW ink mass of a polarity-normalised (ink dark) crop.
+
+    The vertical twin of `column_ink`. A score that scrolls up is a pure
+    vertical translation of this profile, whose peaks are the staff lines, the
+    beam rows and the lyric rows: a strongly structured 1-D signal that
+    registers to a pixel.
+    """
+    ink = np.clip(200.0 - gray.astype(np.float32), 0.0, None)
+    return ink.sum(axis=1)
+
+
+def best_shift(a: np.ndarray, b: np.ndarray, max_shift: int,
+               cap_div: int = 3) -> tuple[int, float, float]:
+    """
+    The integer shift that best takes profile `a` onto profile `b`.
 
     Returns (shift, ncc at that shift, ncc at zero shift). Positive means the
-    content moved to the RIGHT between the two frames. Correlation is computed
-    on the overlap only and normalised there, so a large shift is not rewarded
-    for having fewer samples to disagree on.
+    content moved to the RIGHT (or DOWN, for a row profile) between the two
+    frames. Correlation is computed on the overlap only and normalised there,
+    so a large shift is not rewarded for having fewer samples to disagree on.
+
+    `cap_div` bounds the search to `len/cap_div`, i.e. it fixes the minimum
+    overlap the two windows must retain. The horizontal guard keeps the default
+    3; the vertical tracker relaxes it, because one discrete scroll step can
+    move the band by more than a third of its own height in a single frame gap.
     """
     w = int(min(a.size, b.size))
-    m = int(max(1, min(max_shift, w // 3)))
+    m = int(max(1, min(max_shift, w // max(2, cap_div))))
     best, bestc = 0, -2.0
     zero = _ncc(a[:w], b[:w])
     for s in range(-m, m + 1):
@@ -783,6 +1218,10 @@ def scroll_metrics(profiles: list[np.ndarray], fps: float,
 SCROLL_MIN_PX_PER_S = 12.0      # a whole staff space per second, sustained
 SCROLL_MAX_STILL_FRAC = 0.30    # a real score is stationary most of the time
 SCROLL_MIN_SIGN_CONSISTENCY = 0.85
+# Systems per minute of video, above which the run is printing the same music
+# more than once. Measured: 5.1-9.6 on the fourteen verified videos, 19.0 on the
+# vertically scrolling one before it was registered properly.
+SANITY_MAX_PER_MIN = 16.0
 
 
 def is_scrolling(m: dict) -> bool:
@@ -793,9 +1232,528 @@ def is_scrolling(m: dict) -> bool:
             and m["sign_consistency"] >= SCROLL_MIN_SIGN_CONSISTENCY)
 
 
+# ------------------------------------------------------- vertical scroll track
+#
+# A score that jumps UP the screen in discrete steps is a completely different
+# animal from the horizontal ribbon `ScrollingScore` refuses. It is stationary
+# almost all of the time (which is why the horizontal guard correctly measures
+# 0.0 px/s and leaves it alone), and every system IS wholly on screen for
+# several seconds at a time. Nothing has to be stitched together out of partial
+# views: the frames only have to be put back into the PAGE's own coordinate
+# system before anything is measured, cropped or deduped.
+#
+# What went wrong before this existed: `analyse_layout` reduces the per-frame
+# staff detections to a MODAL layout, which on a page that keeps moving is an
+# average of two or three different scroll phases. On the customer's
+# H_uW2B5A1kE it settled on three slots of pitch 215-221px against a real
+# 247px system pitch, so every crop straddled (one staff plus the lyric row plus
+# a sliver of the next system's beams) and, worse, the same system landed at a
+# DIFFERENT vertical offset in each slot, so its signature never matched its own
+# earlier copy and the dedup could not collapse it. 91 candidates, 1 cross-slot
+# duplicate found, 75 systems and 8 pages printed for a 25 system chart, and
+# `result=OK`.
+#
+# The fix is registration, not stitching:
+#
+#   1. `vscroll_segments`  the page is stationary except during short jumps, so
+#      cut the frame sequence into stable segments at the moving pairs.
+#   2. `vscroll_register`  register each stable segment against the next on the
+#      MEDIAN row-ink profile of the whole segment, which is far cleaner than
+#      any single frame pair, and keep the longest chain of confident links.
+#      That chain is the score; intro cards and outros fall off it.
+#   3. `vscroll_content_band`  the rows that actually travel. Static chrome (the
+#      channel logo, the title bar) has to be excluded before anything is
+#      cropped, or it prints as a black bar across the top of page 1.
+#   4. `vscroll_layout`  map every segment's staff detections into content rows
+#      (content_row = screen_row + offset) and cluster there. On a page standing
+#      still the same system lands on the same content row from every segment
+#      that saw it, so this yields the real system list and the real pitch,
+#      including the pitch VARIATION that a single modal layout cannot express.
+#   5. `vscroll_extract`  crop each system out of the one segment where it sits
+#      wholly inside the moving band, from that segment's median frame.
+#
+# Each system is therefore lifted whole, from frames in which it is stationary,
+# exactly once. There is no dedup step to get wrong.
+
+# A frame pair whose best correlation is below this did not match at any shift
+# (a cut, a fade, a blank); it ends the current stable segment.
+VSCROLL_MIN_NCC = 0.45
+# Segment-to-segment: the registration a content offset is built from. Held much
+# higher than the per-pair threshold because one wrong link shifts every later
+# system by a wrong constant. Real links on H_uW2B5A1kE measure 0.92-1.00.
+VSCROLL_LINK_NCC = 0.75
+# Under this many pixels a pair is stationary: a pixel or two of jitter at 1080p
+# is compression noise, not a scroll.
+VSCROLL_STILL_PX = 3
+# What it takes to call a video a vertically scrolling one at all.
+VSCROLL_MIN_STEP_PX = 24        # a step smaller than a staff is not a scroll
+VSCROLL_MIN_EVENTS = 4          # a couple of jolts is an animation, not a scroll
+VSCROLL_MIN_ONE_WAY = 0.80      # a page turns one way
+VSCROLL_MIN_TRAVEL_BANDS = 1.5  # total travel, in heights of the score band
+# Share of the frame width a ridge must cover to count as a staff line when the
+# page layout is read. Lower than the layout pass's 0.40 on purpose: a final
+# two-bar tag is a short staff, and the count is stable anywhere from 0.30 down
+# to 0.20 on H_uW2B5A1kE (23 systems at 0.40, 24 at 0.30 and below).
+VSCROLL_STAFF_COVER = 0.28
+
+
+def vscroll_pair_shifts(prof: np.ndarray) -> list[int | None]:
+    """
+    Vertical shift between every consecutive pair of frames, or None where the
+    two frames do not correlate at any shift.
+
+    `prof` is (frames, rows): the row-ink profile of the score band per frame.
+    """
+    n = len(prof)
+    if n < 2:
+        return []
+    h = int(prof.shape[1])
+    max_shift = int(max(8, 0.45 * h))
+    out: list[int | None] = []
+    for i in range(n - 1):
+        s, c, _z = best_shift(prof[i], prof[i + 1], max_shift, cap_div=2)
+        out.append(s if c >= VSCROLL_MIN_NCC else None)
+    return out
+
+
+def vscroll_segments(shifts: list[int | None], min_len: int = 3) -> list[tuple[int, int]]:
+    """
+    Maximal runs of frames with no movement between them, as inclusive index
+    pairs. Frames caught mid-jump end up in runs shorter than `min_len` and are
+    dropped: they are motion-blurred or half-scrolled and belong to no page
+    position at all.
+    """
+    segs: list[tuple[int, int]] = []
+    start = 0
+    for i, s in enumerate(shifts):
+        if s is None or abs(s) > VSCROLL_STILL_PX:
+            if i - start + 1 >= min_len:
+                segs.append((start, i))
+            start = i + 1
+    if len(shifts) - start + 1 >= min_len:
+        segs.append((start, len(shifts)))
+    return segs
+
+
+def vscroll_register(meds: list[np.ndarray], band: tuple[int, int]) -> list[tuple[int, float]]:
+    """
+    Shift and correlation between each stable segment's median row profile and
+    the next one's, measured over `band`.
+
+    The search window is deliberately wide (cap_div=2, i.e. half the band): this
+    display jumps one, two or three of its 123px quanta at a time, and a 370px
+    jump measured through a window that only reaches 210px comes back as a
+    confident-looking piece of nonsense (-145px at ncc 0.44, against +370px at
+    ncc 1.00 once the window is wide enough).
+    """
+    b0, b1 = band
+    h = b1 - b0
+    max_shift = int(max(8, 0.45 * h))
+    out: list[tuple[int, float]] = []
+    for k in range(len(meds) - 1):
+        s, c, _z = best_shift(meds[k][b0:b1], meds[k + 1][b0:b1], max_shift, cap_div=2)
+        out.append((s, c))
+    return out
+
+
+def vscroll_chain(links: list[tuple[int, float]]) -> tuple[int, int]:
+    """Longest run of segments joined by confident links, as (first, last)."""
+    if not links:
+        return (0, 0)
+    best = (0, 0)
+    k = 0
+    while k <= len(links):
+        j = k
+        while j < len(links) and links[j][1] >= VSCROLL_LINK_NCC:
+            j += 1
+        if j - k > best[1] - best[0]:
+            best = (k, j)
+        k = j + 1
+    return best
+
+
+def vscroll_content_band(meds: list[np.ndarray], gap: float,
+                         fallback: tuple[int, int]) -> tuple[int, int]:
+    """
+    The rows of the frame that the page actually scrolls through.
+
+    Static chrome (a channel logo, a fixed title bar, a player border) is ink
+    that never changes from one page position to the next; scrolling notation
+    changes completely. Both are separated by comparing, per row, the ink mass
+    against how much that ink mass moved between segments, which needs no
+    threshold tuned to a particular video: notation rows measure a change of
+    0.9-2.1x their own ink, chrome rows 0.03-0.06x.
+
+    Rows with no ink at all (the margin between two systems) are NOT evidence of
+    chrome, so the classification is closed over gaps of a few staff spaces
+    before the largest run is taken.
+    """
+    if len(meds) < 3:
+        return fallback
+    M = np.asarray(meds, dtype=np.float32)
+    ink = M.mean(axis=0)
+    change = np.abs(np.diff(M, axis=0)).mean(axis=0)
+    lvl = float(np.percentile(ink, 85))
+    if lvl <= 0:
+        return fallback
+    raw = ((change > 0.5 * ink) & (ink > 0.10 * lvl)).astype(np.float32)
+    k = max(9, int(round(1.5 * gap))) | 1
+    sm = np.convolve(raw, np.ones(k, np.float32) / k, mode="same") > 0.4
+    close = max(9, int(round(3.0 * gap))) | 1
+    sm = cv2.morphologyEx(sm.astype(np.uint8).reshape(-1, 1), cv2.MORPH_CLOSE,
+                          np.ones((close, 1), np.uint8)).ravel().astype(bool)
+    runs = _runs(sm)
+    if not runs:
+        return fallback
+    r0, r1 = max(runs, key=lambda r: r[1] - r[0])
+    if r1 - r0 < (fallback[1] - fallback[0]) * 0.5:
+        return fallback
+    return (int(r0), int(r1))
+
+
+def vscroll_track(rows: np.ndarray, fps: float, band: tuple[int, int],
+                  gap: float) -> dict:
+    """
+    Everything about the page's vertical motion, in one pass over the row-ink
+    profiles collected during the main frame pass.
+
+        scrolling   the page really does scroll, so use the scroll-aware path
+        segments    stable (first, last) frame index pairs
+        chain       (first, last) SEGMENT index of the longest registered run
+        offsets     content_row = screen_row + offsets[k], per chain segment
+        band        the rows the page scrolls through, chrome excluded
+        step_px     median size of one jump
+        travel_px   total travel over the registered chain
+    """
+    b0, b1 = band
+    out = {"scrolling": False, "segments": [], "chain": [0, 0], "offsets": {},
+           "band": [int(b0), int(b1)], "events": 0, "step_px": 0.0,
+           "travel_px": 0.0, "one_way": 0.0, "frames": int(len(rows)),
+           "links": 0, "px_per_s": 0.0}
+    if len(rows) < 24:
+        return out
+    prof = np.asarray(rows, dtype=np.float32)
+    segs = vscroll_segments(vscroll_pair_shifts(prof[:, b0:b1]))
+    out["segments"] = [[int(a), int(b)] for a, b in segs]
+    if len(segs) < VSCROLL_MIN_EVENTS + 1:
+        return out
+
+    meds = [np.median(prof[a:b + 1], axis=0) for a, b in segs]
+    # a first, coarse chain purely to pick the segments the content band is
+    # measured over: the band needs a registration and the registration wants
+    # the band, so the known-good analysis band breaks the circle.
+    coarse = vscroll_chain(vscroll_register(meds, (b0, b1)))
+    ref = meds[coarse[0]:coarse[1] + 1] if coarse[1] > coarse[0] else meds
+    cband = vscroll_content_band(ref, gap, (b0, b1))
+    links = vscroll_register(meds, cband)
+    k0, k1 = vscroll_chain(links)
+    out["band"] = [int(cband[0]), int(cband[1])]
+    out["chain"] = [int(k0), int(k1)]
+    out["links"] = int(k1 - k0)
+    if k1 - k0 < VSCROLL_MIN_EVENTS:
+        return out
+
+    offs: dict[int, float] = {}
+    o = 0.0
+    steps: list[int] = []
+    for k in range(k0, k1 + 1):
+        offs[k] = o
+        if k < k1:
+            s = links[k][0]
+            steps.append(s)
+            o -= s
+    out["offsets"] = {int(k): float(v) for k, v in offs.items()}
+    arr = np.asarray(steps, dtype=np.float32)
+    moving = arr[np.abs(arr) > VSCROLL_STILL_PX]
+    out["events"] = int(moving.size)
+    out["step_px"] = float(np.median(np.abs(moving))) if moving.size else 0.0
+    out["travel_px"] = float(np.abs(moving).sum()) if moving.size else 0.0
+    if moving.size:
+        out["one_way"] = max(float(np.mean(moving > 0)), float(np.mean(moving < 0)))
+    span = max(1e-6, float(cband[1] - cband[0]))
+    out["px_per_s"] = float(out["travel_px"] / max(len(rows) - 1, 1) * fps)
+    out["travel_bands"] = round(out["travel_px"] / span, 2)
+    out["scrolling"] = is_vscrolling(out)
+    return out
+
+
+def is_vscrolling(tr: dict) -> bool:
+    """
+    The page moved vertically, in one direction, in real steps, far enough that
+    its own coordinate system has to be recovered before anything else is true.
+
+    This is NOT the mirror of `is_scrolling`: it does not refuse a video, it
+    switches onto the path that converts it properly, so it is allowed to fire
+    on a video the ordinary path would also have survived. What it must never do
+    is fire on a stationary score. The ten acceptance videos plus the four
+    sample cases all measure 0 events and 0 travel (see NOTES.md), so nothing
+    but a genuine scroller comes anywhere near these numbers.
+    """
+    return (tr["events"] >= VSCROLL_MIN_EVENTS
+            and tr["step_px"] >= VSCROLL_MIN_STEP_PX
+            and tr["one_way"] >= VSCROLL_MIN_ONE_WAY
+            and tr.get("travel_bands", 0.0) >= VSCROLL_MIN_TRAVEL_BANDS)
+
+
+def regular_staff(lines: list[int], gap: float) -> list[int]:
+    """
+    The longest run of evenly spaced lines in one detected cluster.
+
+    `frame_staff_clusters` groups anything within three staff spaces, which on
+    this video swallows the beam rule that sits exactly 3 x gap above the top
+    staff line of some systems. The cluster's first line is then 48px too high
+    on those frames and 0px too high on the others, so the same system appears
+    to sit at two different content rows. Keeping only the evenly spaced run
+    removes the beam rule and leaves the staff.
+    """
+    if len(lines) < 2:
+        return list(lines)
+    runs: list[list[int]] = [[lines[0]]]
+    for c in lines[1:]:
+        if c - runs[-1][-1] <= 1.6 * gap:
+            runs[-1].append(c)
+        else:
+            runs.append([c])
+    return max(runs, key=len)
+
+
+def vscroll_layout(covs: dict[int, np.ndarray], offsets: dict[int, float],
+                   band: tuple[int, int], gap: float,
+                   height: int) -> list[tuple[float, float]]:
+    """
+    Every system of the page, as (staff top, staff bottom) in CONTENT rows.
+
+    Each stable segment contributes the staffs it can see; they are mapped into
+    content rows and clustered there. A system seen from three segments produces
+    one entry, not three: that is the whole point.
+
+    Three things about the clustering are measured, not chosen:
+
+    * a staff CLIPPED by the edge of the moving band shows fewer lines and a
+      wrong end, and one such detection drags the median top of its system 30px
+      off. Detections within a staff space of either band edge are dropped.
+    * a DENSE system loses lines: noteheads and beams sit on the staff and the
+      ridge coverage of the covered lines falls under the threshold, so bar 70
+      of H_uW2B5A1kE comes back as a 3 line staff from all three segments that
+      see it. Grouping therefore tolerates ends that disagree by up to three
+      staff spaces (real systems are 192px apart at their tightest, so nothing
+      is ever merged that should not be), and the group's span is taken from its
+      best-resolved members only.
+    * a span shorter than the video's usual staff is a partial detection whose
+      missing lines could be at either end, so it is re-centred on the modal
+      staff height rather than trusted as measured.
+    """
+    b0, b1 = band
+    seen: list[tuple[float, float, int]] = []
+    for k, cov in covs.items():
+        off = offsets[k]
+        clusters, _g = frame_staff_clusters(cov, height, VSCROLL_STAFF_COVER)
+        for cl in clusters:
+            cl = regular_staff(cl, gap)
+            if len(cl) < 3 or cl[0] < b0 + gap or cl[-1] >= b1 - gap:
+                continue
+            seen.append((cl[0] + off, cl[-1] + off, len(cl)))
+    if not seen:
+        return []
+    seen.sort(key=lambda s: s[1])
+    groups: list[list[tuple[float, float, int]]] = [[seen[0]]]
+    for s in seen[1:]:
+        if s[1] - groups[-1][-1][1] > 3.0 * gap:
+            groups.append([s])
+        else:
+            groups[-1].append(s)
+    spans: list[tuple[float, float]] = []
+    for G in groups:
+        best = max(g[2] for g in G)
+        top = float(np.median([g[0] for g in G if g[2] == best]))
+        bot = float(np.median([g[1] for g in G if g[2] == best]))
+        spans.append((top, bot))
+    full = float(np.median([b - a for a, b in spans])) if spans else 0.0
+    out: list[tuple[float, float]] = []
+    for a, b in sorted(spans):
+        if full > 0 and (b - a) < 0.75 * full:
+            mid = (a + b) / 2.0
+            a, b = mid - full / 2.0, mid + full / 2.0
+        out.append((a, b))
+    return out
+
+
+def vscroll_boxes(spans: list[tuple[float, float]], gap: float,
+                  page: np.ndarray, origin: int) -> list[tuple[float, float]]:
+    """
+    One crop box per system, cut at the ink-free line between neighbours.
+
+    `page` is the page's own row-ink profile in content rows (`origin` is the
+    content row of `page[0]`), so the boundary between two systems does not have
+    to be guessed at all: it is the last row of blank paper before the next
+    system's beams start, which is exactly where a reader would cut.
+
+    A fixed ratio does not work here and was tried first. The multi-slot layout
+    splits the free space 60/40 (beams above, lyrics below) and on H_uW2B5A1kE
+    the lyric row eats 46% of it, so every 40% cut sliced the Korean lyrics in
+    half lengthwise and left the top halves sitting under the staff. Measured,
+    the real boundary lands between 0.44 and 0.62 of the gap on this one video
+    alone, which is precisely the range no constant covers.
+    """
+    if not spans:
+        return []
+    prof = np.convolve(np.asarray(page, dtype=np.float32),
+                       np.ones(5, np.float32) / 5.0, mode="same")
+    cuts: list[float] = []
+    for i in range(len(spans) - 1):
+        s1, s0 = spans[i][1], spans[i + 1][0]
+        a = int(round(s1 + 0.5 * gap)) - origin
+        b = int(round(s0 - 1.0 * gap)) - origin
+        a = max(0, min(a, len(prof) - 1))
+        b = max(a + 1, min(b, len(prof)))
+        w = prof[a:b]
+        if w.size < 2:
+            cuts.append((s1 + s0) / 2.0)
+            continue
+        blank = _runs(w <= 0.02 * max(float(w.max()), 1.0))
+        if blank:
+            r0, r1 = blank[-1]
+            cuts.append(float(origin + a + (r0 + r1) / 2.0))
+        else:
+            cuts.append(float(origin + a + int(np.argmin(w))))
+    if not cuts:
+        return [(spans[0][0] - 4.0 * gap, spans[0][1] + 4.0 * gap)]
+    above = float(np.median([spans[i][0] - cuts[i - 1] for i in range(1, len(spans))]))
+    below = float(np.median([cuts[i] - spans[i][1] for i in range(len(spans) - 1)]))
+    boxes = [(spans[0][0] - above, cuts[0])]
+    for i in range(1, len(spans) - 1):
+        boxes.append((cuts[i - 1], cuts[i]))
+    if len(spans) > 1:
+        boxes.append((cuts[-1], spans[-1][1] + below))
+    return boxes
+
+
+def vscroll_page_profile(meds: dict[int, np.ndarray], offsets: dict[int, float],
+                         band: tuple[int, int]) -> tuple[np.ndarray, int]:
+    """
+    The whole page's row-ink profile, in content rows, built by dropping every
+    segment's own profile at its registered offset and averaging the overlaps.
+
+    Returns (profile, origin): profile[0] is content row `origin`.
+    """
+    b0, b1 = band
+    origin = int(np.floor(min(offsets.values()))) + b0
+    end = int(np.ceil(max(offsets.values()))) + b1
+    acc = np.zeros(max(end - origin, 1), np.float64)
+    cnt = np.zeros_like(acc)
+    for k, m in meds.items():
+        r = row_ink(m)
+        a = b0 + int(round(offsets[k])) - origin
+        b = a + (b1 - b0)
+        a, b = max(a, 0), min(b, len(acc))
+        if b > a:
+            acc[a:b] += r[b0:b0 + (b - a)]
+            cnt[a:b] += 1
+    return (acc / np.maximum(cnt, 1)).astype(np.float32), origin
+
+
+def scroll_gray(bgr: np.ndarray, polarity: str) -> np.ndarray:
+    """
+    Ink-dark grey for the motion measurement only.
+
+    Deliberately NOT `normalise_ink`: that recovers the compositing alpha
+    against the background PLATE, and on a scrolling video the plate is a
+    temporal percentile of content that never stopped moving, i.e. a smear. The
+    tracker only needs a profile that translates with the page, and a plain
+    (inverted, for white ink) grey does that with no dependence on the plate.
+    """
+    g = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    return g if polarity == "dark_ink" else (255 - g)
+
+
+def vscroll_extract(video: Path, lay: Layout, tr: dict, fps: float, sat: int,
+                    max_per_seg: int = 24, progress=None) -> tuple[list[np.ndarray], dict]:
+    """
+    Lift every system of a vertically scrolling page, once, as a whole.
+
+    Second decode of the video: the first pass only measured the motion, and
+    holding a whole video's frames to re-crop them later would cost gigabytes.
+    Each stable segment collapses to ONE median frame (the playhead sits at a
+    different x in every frame of the segment, so the median erases it exactly
+    as it does for a stationary score), and every system is then cropped out of
+    the single segment where it sits wholly inside the moving band, furthest
+    from both its edges.
+
+    Returns (composites in page order, info) where the composites are grey with
+    dark ink, the same thing `composite_line` returns.
+    """
+    segs = [(int(a), int(b)) for a, b in tr["segments"]]
+    offsets = {int(k): float(v) for k, v in tr["offsets"].items()}
+    band = (int(tr["band"][0]), int(tr["band"][1]))
+    want: dict[int, int] = {}                  # frame index -> segment index
+    for k in sorted(offsets):
+        a, b = segs[k]
+        idx = np.linspace(a, b, min(max_per_seg, b - a + 1)).astype(int)
+        for i in set(int(x) for x in idx):
+            want[i] = k
+    bufs: dict[int, list[np.ndarray]] = {k: [] for k in offsets}
+    meds: dict[int, np.ndarray] = {}
+    n = 0
+    for i, (_t, f) in enumerate(iter_frames(video, fps, lay.width, lay.height)):
+        n += 1
+        k = want.get(i)
+        if k is None:
+            continue
+        bufs[k].append(normalise_ink(f, lay.plate, lay.polarity, sat, lay.staff_gap))
+        if i >= segs[k][1] - 1 and bufs[k]:
+            meds[k] = np.median(np.stack(bufs[k]), axis=0).astype(np.uint8)
+            bufs[k] = []
+            if progress is not None:
+                progress(len(meds) / max(len(offsets), 1))
+    for k, buf in bufs.items():               # anything the loop ended on
+        if buf and k not in meds:
+            meds[k] = np.median(np.stack(buf), axis=0).astype(np.uint8)
+    log(f"vscroll: {n} frames re-read, {len(meds)}/{len(offsets)} segment composites")
+    if len(meds) < 3:
+        return [], {"systems": 0}
+
+    covs = {k: staff_row_coverage(m, "dark_ink") for k, m in meds.items()}
+    spans = vscroll_layout(covs, offsets, band, lay.staff_gap, lay.height)
+    page, origin = vscroll_page_profile(meds, {k: offsets[k] for k in meds}, band)
+    boxes = vscroll_boxes(spans, lay.staff_gap, page, origin)
+    pitch = [round(spans[i + 1][0] - spans[i][0], 1) for i in range(len(spans) - 1)]
+    log(f"vscroll: {len(spans)} systems on the page, staff pitch "
+        f"{min(pitch) if pitch else 0:.0f}..{max(pitch) if pitch else 0:.0f}px "
+        f"(median {float(np.median(pitch)) if pitch else 0:.0f})")
+
+    comps: list[np.ndarray] = []
+    picked: list[dict] = []
+    missed = 0
+    for i, (c0, c1) in enumerate(boxes):
+        best = None
+        for k, off in offsets.items():
+            if k not in meds:
+                continue
+            y0, y1 = c0 - off, c1 - off
+            if y0 < band[0] or y1 > band[1]:
+                continue
+            margin = min(y0 - band[0], band[1] - y1)
+            score = (margin, segs[k][1] - segs[k][0])
+            if best is None or score > best[0]:
+                best = (score, k, int(round(y0)), int(round(y1)))
+        if best is None:
+            missed += 1
+            log(f"vscroll: system {i} (content rows {c0:.0f}..{c1:.0f}) is never "
+                f"wholly inside the band, skipped")
+            continue
+        _s, k, y0, y1 = best
+        comps.append(meds[k][y0:y1].copy())
+        picked.append({"system": i, "segment": k, "content": [round(c0, 1), round(c1, 1)],
+                       "screen": [y0, y1]})
+    info = {"systems": len(comps), "spans": len(spans), "skipped": missed,
+            "pitch_px": pitch, "picked": picked}
+    return comps, info
+
+
 def staff_anchor(prof: np.ndarray, gap: float, target_top: int) -> int:
     """
     Row of the staff this frame is showing, or -1 when there is no staff.
+
 
     The anchor is the staff CLUSTER nearest the layout's staff, not the topmost
     staff row: two lines are on screen during a slide and the neighbour's staff
@@ -1016,6 +1974,22 @@ def ink_strength(comp: np.ndarray) -> float:
     return max(0.0, (hi - lo) / 255.0)
 
 
+INK_SHARE_FLOOR = 0.11      # of the video's own median candidate ink share
+
+
+def ink_share(strip: np.ndarray) -> float:
+    """
+    How much of this strip is actually inked, measured on the RENDERED strip.
+
+    `ink_strength` asks how dark the darkest ink gets, which says nothing about
+    how much of it there is: a white box with one grey border rule and a broken
+    two-line staff both reach a perfectly respectable strength. This is the
+    other half, and it is what separates a printed system from an empty one.
+    """
+    g = strip if strip.ndim == 2 else cv2.cvtColor(strip, cv2.COLOR_BGR2GRAY)
+    return float((g < 128).mean())
+
+
 def _rolling_hits(src_cores: list[np.ndarray], src_t: list[float],
                   dst_cores: list[np.ndarray], dst_t: list[float]) -> float:
     """Fraction of src systems that reappear LATER in dst."""
@@ -1059,8 +2033,121 @@ def detect_rolling(group_times: list[list[float]], cores: list[list[np.ndarray]]
     return (0, 1) if f10 > f01 else (1, 0)
 
 
+# --------------------------------------------------------------------------
+# Frames taken while the page was SLIDING past the band.
+#
+# A system is a thing that stands still on screen. `YkjcWb63v0o` ends by
+# scrolling its page up out of the band over three quarters of a second, and the
+# three sampled frames caught in that slide each looked like a brand new line to
+# `group_lines` (their staff sits at row 103, then 65, then 14, against 106 held
+# for the previous 45 frames), so the last system of the score was composited
+# and printed FOUR times. That is the customer's "마지막장 같은마디 반복".
+#
+# What the three copies have and a real system does not is not their picture:
+# the copies correlate 0.910 with the original, which is inside the band where
+# genuinely different bars of this repetitive drum groove live (bars 57/65/73
+# correlate 0.94-0.99 with each other). It is their MOTION. Registering each
+# frame's row-ink profile against its temporal neighbour separates the two
+# completely: a settled frame registers at shift 0 with the correlation at zero
+# shift already 1.00, and a sliding frame only correlates once it is shifted.
+# --------------------------------------------------------------------------
+TRAVEL_MIN_NCC = 0.50       # under this the pair is a cut or a fade, not travel
+TRAVEL_MIN_PX = 2           # a pixel of registration jitter is compression noise
+TRAVEL_MARGIN = 0.25        # sliding has to explain the pair better than standing still
+
+
+def mark_travelling(frames: list[SlotFrame], gap: float, dt: float) -> int:
+    """
+    Flag every frame that sits inside a vertical slide of the page.
+
+    A pair of consecutive frames is travelling when its row-ink profiles
+    register at a non-zero shift, that registration is good, and it is
+    *substantially* better than standing still. All three are needed:
+
+    * the shift alone fires on noise, so it has to clear TRAVEL_MIN_PX;
+    * the registered correlation alone fires on a cut to a blank outro, where
+      nothing matches at any shift and the argmax is meaningless;
+    * the margin over the zero-shift correlation is what keeps a settled frame
+      out. A static pair registers at shift 0, so both numbers are the same and
+      the margin is 0.00; the customer's three sliding frames measure 0.98/0.26,
+      0.60/0.00 and 0.54/0.00 (registered/zero).
+
+    A frame counts as travelling only if the pair on one side of it does, which
+    deliberately keeps the LAST settled frame before a slide begins (its
+    incoming pair is static) inside its own group.
+
+    Returns how many frames were flagged. Pairs more than 2.5 sample periods
+    apart are not compared at all: the frames between them were thrown out for
+    having no staff, so any registration across the hole is a guess.
+    """
+    flags = travelling_flags([row_ink(f.gray) for f in frames],
+                             [f.t for f in frames], gap, dt)
+    for f, v in zip(frames, flags):
+        f.travelling = v
+    return sum(flags)
+
+
+def travelling_flags(profs: list[np.ndarray], times: list[float],
+                     gap: float, dt: float) -> list[bool]:
+    """`mark_travelling` on nothing but the row-ink profiles, so a fixture can
+    replay a slide without carrying the frames (see `ci/slide_check.py`)."""
+    if len(profs) < 2:
+        return [False] * len(profs)
+    limit = max(8, int(round(6.0 * gap)))
+    moved = [False] * (len(profs) - 1)
+    for i in range(len(profs) - 1):
+        if times[i + 1] - times[i] > 2.5 * dt:
+            continue
+        dy, ncc, zero = best_shift(profs[i], profs[i + 1], limit, cap_div=2)
+        moved[i] = (abs(dy) >= TRAVEL_MIN_PX and ncc >= TRAVEL_MIN_NCC
+                    and ncc - zero >= TRAVEL_MARGIN)
+    return [(i > 0 and moved[i - 1]) or (i < len(moved) and moved[i])
+            for i in range(len(profs))]
+
+
+def sliding_groups(groups: list[list[SlotFrame]], dt: float) -> set[int]:
+    """
+    Which groups were cut out of a page that never stopped moving.
+
+    A group every frame of which is travelling is a sample of a slide rather
+    than a system -- but ONE such group sitting between two settled ones is
+    ambiguous. `a09-kimyongtae` flips to its next line in a single sample
+    period five times over, and each of those five transition frames is
+    all-travelling; they are junk (each is a truncated redraw of the line above
+    it) but they are printed today and this pass is not allowed to move that
+    video's count.
+
+    A RUN of them is not ambiguous. If the page is still moving a sample period
+    later, then nothing came to rest in between, so everything the run saw was
+    either already printed from a settled view or is about to be. That is what
+    separates the five a09 transitions (runs of 1) from the three copies of
+    YkjcWb63v0o's last bar (a run of 3, at 103 -> 65 -> 14 rows).
+
+    Runs must be contiguous in TIME as well as in the group list: frames with no
+    staff at all are thrown out before grouping, so two group indices can be
+    seconds apart, and a slide either side of that hole is two events.
+    """
+    allmv = [bool(g) and all(f.travelling for f in g) for g in groups]
+    out: set[int] = set()
+    for i, mv in enumerate(allmv):
+        if not mv:
+            continue
+        near_prev = (i > 0 and allmv[i - 1]
+                     and groups[i][0].t - groups[i - 1][-1].t <= 2.5 * dt)
+        near_next = (i + 1 < len(allmv) and allmv[i + 1]
+                     and groups[i + 1][0].t - groups[i][-1].t <= 2.5 * dt)
+        if near_prev or near_next:
+            out.add(i)
+    return out
+
+
 HEAD_NEW = 0.45             # header this different is a new system on its own
 HEAD_RUN = 3                # ...but only once it has stayed different this many frames
+
+
+LAST_GROUP_TRACE: list[tuple[float, float, float, float, float, int]] = []
+LAST_GROUP_RESETS = 0
+LAST_GROUP_SPLITS = 0
 
 
 def group_lines(frames: list[SlotFrame], thresh: float) -> list[list[SlotFrame]]:
@@ -1081,13 +2168,30 @@ def group_lines(frames: list[SlotFrame], thresh: float) -> list[list[SlotFrame]]
 
     A genuinely new line clears both (measured: 0.42-0.55 graded, 0.52-0.92
     binary), so the AND costs nothing on a real line change.
+
+    ...and a video that engraves the same groove for five systems running
+    defeats both at once, because there is nothing in the picture to see. That
+    is what `playhead_resets` is for, applied as a pure SUBDIVISION of the
+    groups this loop produced (see `split_on_playhead`): a boundary is added
+    inside a group that swallowed several systems, and no boundary this loop
+    found is ever moved, so none of the thresholds calibrated above shift under
+    it.
+
+    Feeding the resets into the loop instead is measurably worse and was tried
+    first: on `a10-drumtab` the reset at t=8.25s lands inside the opening
+    system's 1.2s fade-in, and re-anchoring there moved the picture boundaries
+    that follow it, turning that video's two fade-in copies into three.
     """
     groups: list[list[SlotFrame]] = []
     anchor: np.ndarray | None = None
     anchor_fp: np.ndarray | None = None
     anchor_head: np.ndarray | None = None
     head_run = 0
-    for f in frames:
+    # Every frame's two distances against the running anchor, for the diagnostic
+    # that reads them back (`YTSCORE_DUMP_DIST`). A group that swallowed five
+    # screens is only legible next to the numbers that let each screen through.
+    trace: list[tuple[float, float, float, float, float, int]] = []
+    for fi, f in enumerate(frames):
         # A changed HEADER is a new system on its own evidence. The staff picture
         # cannot always show it: sample case 0's measures 53-56 and 57-60 are four
         # bars of rest under one lyric, identical to within two digits, so on the
@@ -1098,13 +2202,16 @@ def group_lines(frames: list[SlotFrame], thresh: float) -> list[list[SlotFrame]]
         # seconds picks up transients -- the slide-in smear, a highlight box, the
         # playhead crossing a rest -- and a single frame of those was enough to
         # print sample case 0's measure 57 three times over.
-        head_run = (head_run + 1) if (anchor_head is not None and f.hkey is not None
-                                      and jaccard(f.hkey, anchor_head) > HEAD_NEW) else 0
+        hd = (jaccard(f.hkey, anchor_head)
+              if (anchor_head is not None and f.hkey is not None) else 0.0)
+        head_run = (head_run + 1) if hd > HEAD_NEW else 0
         head_changed = head_run >= HEAD_RUN
+        bj = 1.0 if anchor is None else jaccard(f.key, anchor)
+        gj = 1.0 if anchor_fp is None else soft_jaccard(f.fp, anchor_fp)
         new = (anchor is None
                or head_changed
-               or (jaccard(f.key, anchor) > thresh
-                   and soft_jaccard(f.fp, anchor_fp) > thresh))
+               or (bj > thresh and gj > thresh))
+        trace.append((f.t, bj, gj, hd, f.phx, int(new)))
         if new:
             groups.append([f])
             anchor = f.key.copy()
@@ -1115,7 +2222,61 @@ def group_lines(frames: list[SlotFrame], thresh: float) -> list[list[SlotFrame]]
             groups[-1].append(f)
             anchor |= f.key
             anchor_fp = np.minimum(anchor_fp, f.fp)      # darkest wins: union of ink
+    global LAST_GROUP_TRACE, LAST_GROUP_RESETS, LAST_GROUP_SPLITS
+    LAST_GROUP_TRACE = trace
+    resets = playhead_resets(frames)
+    LAST_GROUP_RESETS = len(resets)
+    before = len(groups)
+    groups = split_on_playhead(groups, resets)
+    LAST_GROUP_SPLITS = len(groups) - before
     return groups
+
+
+PLAY_PIECE = 4              # frames: neither side of a split may be shorter
+
+
+def split_on_playhead(groups: list[list[SlotFrame]],
+                      resets: set[int]) -> list[list[SlotFrame]]:
+    """
+    Cut a group wherever the playhead started over inside it.
+
+    Only INSIDE. A reset on a group's first frame is a boundary the picture rule
+    already found and changes nothing, and no boundary is ever removed, so a
+    video the picture rule handles correctly cannot move: the only groups this
+    touches are the ones that swallowed a system whole.
+
+    ...and only when both halves are long enough to BE a system. `a10-drumtab`
+    is why: its playhead is already sweeping over the intro banner and resets at
+    t=8.25s while the opening system is still 1.2 seconds into its fade-in, so
+    the split lands two frames into a two-frame group and turns that video's two
+    fade-in copies of system 1 into three. Measured over the corpus, the pieces
+    a real system boundary produces are 15 to 32 frames and the only pieces
+    under 6 are a10's pair of 1s, so PLAY_PIECE sits in a very wide empty band.
+
+    Over the 17-video corpus the videos whose playhead this pipeline can see at
+    all are a01, a04, a07, a08, a10, case1, case2 and the customer's
+    d3t9j6DObN0. Every group this pass actually cuts is a defect: `a04` was
+    silently missing TEN of its systems (its bar ladder ran 1, 9, 13, 21, 29 in
+    steps of 8 where the engraving steps by 4), `a08-abcdrum` had composited its
+    bars 21 and 25 into one strip with two lyric rows printed on top of each
+    other, and `d3t9j6DObN0` had swallowed five whole systems. All three had
+    been called print-clean or ghost-only on a count.
+    """
+    if not resets:
+        return groups
+    out: list[list[SlotFrame]] = []
+    i = 0
+    for g in groups:
+        cuts: list[int] = []
+        last = 0
+        for k in range(1, len(g)):
+            if (i + k) in resets and k - last >= PLAY_PIECE and len(g) - k >= PLAY_PIECE:
+                cuts.append(k)
+                last = k
+        for a, b in zip([0] + cuts, cuts + [len(g)]):
+            out.append(g[a:b])
+        i += len(g)
+    return out
 
 
 @dataclass
@@ -1129,9 +2290,15 @@ class Cand:
     head: np.ndarray            # binary mark of the rows above the staff (measure no., marker)
     strength: float             # how dark this system's ink actually gets, 0..1
     cov: float = 0.0            # staff-line coverage of the prepared strip
+    sliding: bool = False       # every frame behind it was taken mid-slide
 
 
-def drop_fade_copies(cands: list[Cand], ratio: float = 0.78) -> tuple[list[Cand], list[int]]:
+FADE_RATIO = 0.80           # below this ink ratio, the fainter of two matching
+                            # neighbours is a half-drawn fade copy
+
+
+def drop_fade_copies(cands: list[Cand],
+                     ratio: float = FADE_RATIO) -> tuple[list[Cand], list[int]]:
     """
     Remove the half-drawn copies a fade-in / fade-out leaves behind.
 
@@ -1151,6 +2318,29 @@ def drop_fade_copies(cands: list[Cand], ratio: float = 0.78) -> tuple[list[Cand]
     Discriminators tried on the sample runs that do NOT work: the 2nd-percentile
     grey level alone (case 0 has legitimate sparse systems at p2=123) and the
     dark/any ink ratio (case 2's fade sits at 0.252 against a real 0.277).
+
+    FADE_RATIO was 0.78 through 1.7.0 and is 0.80 from 1.7.1. It moved for
+    exactly one pair, `YkjcWb63v0o`'s Intro printed twice at the top of page 1
+    (t=7.5s/8.0s, strengths 0.784 and 0.616, ratio 0.785, match 0.957), and it
+    moved only because the whole corpus was swept first. Raising a DELETE
+    threshold is the most dangerous change on this project: d3t9j6DObN0 had four
+    whole systems silently missing because five near-identical systems were all
+    genuine. The measurement that made this safe, `ci/fade_sweep.py out/v176`,
+    over 590 adjacent pairs on 21 runs:
+
+    * the band [0.78, 0.80) with match >= CORE_SAME holds **exactly one pair in
+      the whole corpus**, the Intro pair above;
+    * five other pairs land in that ratio band but match 0.329-0.505, so the
+      match gate already refuses them and would still refuse them at any ratio;
+    * replaying fade + repeat end to end at both cuts, the surviving system list
+      is byte-identical on 20 of 21 videos, and on caseC it loses that one copy
+      and nothing else. The t=15.75s candidate the wider cut also takes is NOT a
+      new deletion: 1.7.0 already dropped it one pass later in
+      `drop_adjacent_repeats` (picture 0.971 against the same Intro). The two
+      cuts differ in which pass removes it, not in what reaches the page.
+
+    Do not move this cut again without re-running that sweep. `ci/fade_check.py`
+    is its gate and fails in both directions.
     """
     out = list(cands)
     dropped: list[int] = []
@@ -1168,6 +2358,9 @@ def drop_fade_copies(cands: list[Cand], ratio: float = 0.78) -> tuple[list[Cand]
             # too faint for its own staff to be detected still lines up exactly.
             # Only across slots is the staff-core crop needed to align them.
             m = core_match(a.box, b.box) if a.si == b.si else core_match(a.core, b.core)
+            if os.environ.get("YTSCORE_DIAG"):
+                log(f"fade?: t={a.t:.1f}s/{b.t:.1f}s ink {lo:.3f}/{hi:.3f} "
+                    f"= {lo / hi:.3f} (need < {ratio}) match {m:.3f} (need >= {CORE_SAME})")
             if m < CORE_SAME:
                 continue
             weak = i if a.strength < b.strength else i + 1
@@ -1183,6 +2376,7 @@ def drop_fade_copies(cands: list[Cand], ratio: float = 0.78) -> tuple[list[Cand]
 
 
 REPEAT_SAME = 0.96          # >= this, two adjacent systems are the same picture
+REPEAT_CERTAIN = 0.985      # ...and above this the header no longer gets a veto
 
 
 def drop_adjacent_repeats(cands: list[Cand],
@@ -1212,6 +2406,24 @@ def drop_adjacent_repeats(cands: list[Cand],
     measures 57-60 was being deleted from the PDF. The full box, which is the
     same crop at the same scale for every system of a slot, correlates 0.30 on
     that pair and still 1.00 on a genuine redraw.
+
+    ...but the header only gets a VETO up to REPEAT_CERTAIN. `KsSlNq-ciko` is
+    the customer's second "마지막장 같은마디 반복" video and it fails here rather
+    than on the slide: its last frame is a single-frame group whose picture
+    matches the 58-frame group before it at **0.999**, and it was printed anyway
+    because the header distance came out 1.000. That is not two different
+    numbers, it is one number the fixed ink threshold could not read on a frame
+    that is already fading, so the band came back empty against a band with "61"
+    in it, and an empty-vs-inked Jaccard is 1.0 by construction.
+
+    Above 0.985 the header cannot be telling the truth: two systems that are
+    genuinely different bars do not correlate that hard over a box that contains
+    the measure-number row (case 0's 53-56 against 57-60 sits at 0.30). The cut
+    is where it is because it is measured: over 423 adjacent pairs on the
+    17-video corpus the highest picture match on a pair the header vetoed is
+    **0.937** (a04 at t=104.0 vs 98.2), and the only pair anywhere above 0.985
+    is a10's 0.991, which the header agreed to drop anyway. So the band from
+    0.937 to 0.999 is empty and the cut sits inside it.
     """
     out: list[Cand] = []
     dropped: list[int] = []
@@ -1222,15 +2434,151 @@ def drop_adjacent_repeats(cands: list[Cand],
                 else core_match(prev.core, c.core)
         else:
             m = 0.0
-        if out and m >= thresh and jaccard(out[-1].head, c.head) <= HEAD_SAME:
+        hj = jaccard(out[-1].head, c.head) if out else 1.0
+        if os.environ.get("YTSCORE_DIAG") and out:
+            log(f"repeat?: t={c.t:.1f}s vs t={out[-1].t:.1f}s picture {m:.3f} "
+                f"(need >= {thresh}) header {hj:.3f} (need <= {HEAD_SAME} "
+                f"or picture >= {REPEAT_CERTAIN})")
+        if out and m >= thresh and (hj <= HEAD_SAME or m >= REPEAT_CERTAIN):
             dropped.append(len(out) + len(dropped))
+            why = "same header" if hj <= HEAD_SAME else "identical picture"
             log(f"repeat: system at t={c.t:.1f}s is the previous system redrawn "
-                f"(picture {m:.3f}, same header) -> dropped")
+                f"(picture {m:.3f}, {why}) -> dropped")
             continue
         out.append(c)
     if dropped:
         log(f"repeat: {len(dropped)} redrawn copies dropped -> {len(out)} systems")
     return out, dropped
+
+
+def _blank_runs(prof: np.ndarray, gap: float) -> list[tuple[int, int]]:
+    """Ink-free row runs of a smoothed row-ink profile, widest-usable first."""
+    if prof.size < 3:
+        return []
+    sm = np.convolve(prof.astype(np.float32), np.ones(3, np.float32) / 3.0, mode="same")
+    top = float(sm.max())
+    if top <= 0:
+        return []
+    runs = _runs(sm <= 0.02 * top)
+    keep = [r for r in runs if r[1] - r[0] >= max(2, int(round(0.4 * gap)))]
+    return keep or runs
+
+
+def system_extent(comp: np.ndarray, gap: float, target_top: int,
+                  reach: float) -> tuple[int, int]:
+    """
+    Cut one composited system back to ITS OWN extent, at the ink-free line.
+
+    The slot box is a rectangle of screen, not a system. Where a video re-lays
+    its score out from screen to screen (zDG0Tw7MDXg does it six times) the box
+    sits at the modal phase, so on the other phases it clips the measure number
+    off the top of its own system and takes the beam row of the NEXT system in
+    at the bottom. That beam row is then printed twice, once as a headless
+    sliver under its neighbour and once properly with its own staff, and at a
+    page boundary the two copies land on facing pages: bars 57, 65 and 94 of the
+    customer's own PDF each appeared twice that way.
+
+    The system's real boundary is not a ratio of the gap, it is the blank paper
+    between two systems, so it is measured here rather than assumed. `reach` is
+    how far out of the staff it is worth looking (half the slot pitch): past
+    that we are inside the neighbour and a blank run means nothing.
+
+    Nothing is cut on a side where no ink-free line was found. A translucent
+    overlay score has no blank paper to find, and leaving that strip exactly as
+    it was today is strictly better than guessing a boundary for it.
+    """
+    h = comp.shape[0]
+    cov = staff_row_coverage(comp, "dark_ink")
+    top = staff_anchor(cov, gap, target_top)
+    if top < 0:
+        return 0, h
+    rows = np.where(cov > 0.40)[0]
+    rows = rows[(rows >= top - gap) & (rows <= top + 6.0 * gap)]
+    bot = int(rows.max()) if rows.size else int(round(top + 4.0 * gap))
+    if bot <= top:
+        bot = int(round(top + 4.0 * gap))
+
+    prof = row_ink(comp)
+    lo, hi = 0, h
+    # above: the last blank band before the staff is the one over this system's
+    # own measure number and beams, so cut in the middle of it.
+    a = max(0, int(round(top - reach)))
+    b = max(a + 1, int(round(top - 1.0 * gap)))
+    if b - a >= 4:
+        runs = _blank_runs(prof[a:b], gap)
+        if runs:
+            r0, r1 = runs[-1]
+            lo = a + (r0 + r1) // 2
+    # below: the LAST blank band, not the first. A lyric row sits under the
+    # staff with clear paper above it, so cutting at the first blank band throws
+    # the lyrics away -- case 1 lost the words under bars 20 and 24 that way.
+    # The last band is the one after this system's own lyrics and before the
+    # next system's beams, which is where a reader would cut.
+    a = min(h - 1, int(round(bot + 0.5 * gap)))
+    b = min(h, int(round(bot + reach)))
+    if b - a >= 4:
+        runs = _blank_runs(prof[a:b], gap)
+        if runs:
+            r0, r1 = runs[-1]
+            hi = a + (r0 + r1) // 2
+    if hi - lo < (bot - top) + int(round(2.0 * gap)):
+        return 0, h
+    return lo, hi
+
+
+def reg_profile(gray: np.ndarray) -> np.ndarray:
+    """Mean-removed row ink profile, the signal `measure_dy` registers on."""
+    p = (255.0 - gray.astype(np.float32)).sum(axis=1)
+    return p - float(p.mean())
+
+
+REG_TIE = 0.98              # shifts scoring within this of the best are a tie
+REG_FLOOR = 0.50            # below this the profiles do not match at all
+REG_MIN_GAPS = 0.70         # below this the anchor is kept; see composite_line
+
+
+def measure_dy(ref: np.ndarray, prof: np.ndarray, limit: int) -> tuple[int, float]:
+    """
+    How many rows this frame's content sits BELOW the reference frame's, read
+    off the pixels rather than off the staff-line anchor.
+
+    `staff_anchor` returns the first detected line of the staff cluster nearest
+    the layout, and on EVprtoI_3eY it is not stable: whenever the top staff line
+    of a frame drops under the 0.40 coverage cut, the anchor locks onto a line
+    THREE rows further down and reports a staff that has moved 51px (3 x gap)
+    when nothing on screen moved at all. `composite_line` then registered a
+    third of the frames 51px away from the rest and the median of the two
+    populations came out as a double exposure: the customer's "2페이지 위아래
+    흐림". Groups 8, 9, 18 and 31 of that video are the ones that straddle it.
+
+    Correlating the row ink profiles cannot make that mistake, because it asks
+    the picture where it is instead of asking one detector twice. Ties are
+    broken toward the SMALLEST shift, which is what kills the staff's own
+    periodicity: a 5-line staff correlates almost as well one staff space out,
+    so with a plain argmax a group could still be pulled apart by one gap.
+
+    Returns (dy, score). A score below REG_FLOOR means the two frames are not
+    the same picture at all (one is mid-slide), and the caller keeps the anchor.
+    """
+    n = ref.size
+    best_s, best_dy = -1.0, 0
+    scores: list[tuple[float, int]] = []
+    for dy in range(-limit, limit + 1):
+        if dy >= 0:
+            a, b = ref[dy:], prof[:n - dy] if dy else prof
+        else:
+            a, b = ref[:n + dy], prof[-dy:]
+        if a.size < max(8, n // 2):
+            continue
+        den = float(np.linalg.norm(a) * np.linalg.norm(b))
+        s = float(a @ b / den) if den > 0 else -1.0
+        scores.append((s, dy))
+        if s > best_s:
+            best_s, best_dy = s, dy
+    if not scores:
+        return 0, -1.0
+    near = [dy for s, dy in scores if s >= REG_TIE * best_s]
+    return min(near, key=abs), best_s
 
 
 def composite_line(group: list[SlotFrame], gap: float = 0.0, trim: int = 1) -> np.ndarray:
@@ -1255,6 +2603,26 @@ def composite_line(group: list[SlotFrame], gap: float = 0.0, trim: int = 1) -> n
     done HERE and not before the grouping: registering frames before they are
     grouped changes what counts as a line change and split the verified samples
     into 27 and 31 systems instead of 19 and 29.
+
+    The shift itself is MEASURED on the pixels (`measure_dy`), not taken from
+    the staff anchor. The anchor still picks the reference frame, so the strip
+    lands at the same row it always did and every downstream offset is
+    untouched; it just no longer decides how far each frame moves. See
+    `measure_dy` for the defect that forced it.
+
+    The measurement only OVERRIDES the anchor when the two disagree by at least
+    `REG_MIN_GAPS` of a staff space, because that is the only mistake the anchor
+    actually makes: it locks onto the wrong LINE of the staff, which moves it by
+    a whole number of staff spaces and nothing else. Measured over the 17-video
+    corpus, every disagreement is either <= 0.50 gap (registration noise on a
+    line that never moved) or >= 0.88 gap (1.0, 2.0, 3.0 gaps: the anchor
+    jumping lines), with nothing in between, so the cut sits in an empty band.
+
+    Following the sub-gap half is not harmless. It nudges frames the 1.5.0
+    pipeline left alone, and on a10-drumtab that was enough to align the intro
+    KakaoTalk banner into something whose staff coverage read 0.42 instead of
+    0.08, so the "mid-animation" drop let it through and a junk strip appeared
+    as system 1 of a print-clean video. Sub-gap disagreements keep the anchor.
     """
     frames = group
     if len(group) > 2 * trim + 1:
@@ -1263,8 +2631,31 @@ def composite_line(group: list[SlotFrame], gap: float = 0.0, trim: int = 1) -> n
     if tops and gap > 0:
         ref = int(np.median(tops))
         limit = int(round(4.0 * gap))
-        stack = np.stack([shift_rows(f.gray, int(np.clip(ref - f.top, -limit, limit)))
-                          if f.top >= 0 else f.gray for f in frames])
+        anchor = [int(np.clip(ref - f.top, -limit, limit)) if f.top >= 0 else 0
+                  for f in frames]
+        pivot = min(range(len(frames)),
+                    key=lambda i: (frames[i].top < 0, abs(frames[i].top - ref)))
+        rprof = reg_profile(frames[pivot].gray)
+        shifts: list[int] = []
+        weak = 0
+        held = 0
+        for f, a in zip(frames, anchor):
+            dy, sc = measure_dy(rprof, reg_profile(f.gray), limit)
+            if sc < REG_FLOOR:
+                weak += 1
+                dy = a
+            elif abs(dy - a) < REG_MIN_GAPS * gap:
+                held += 1
+                dy = a
+            shifts.append(dy)
+        if os.environ.get("YTSCORE_DIAG"):
+            dis = [(a, d) for a, d in zip(anchor, shifts) if a != d]
+            if dis:
+                log(f"reg?: t={frames[0].t:.1f}s n={len(frames)} ref_top={ref} "
+                    f"weak={weak} held={held} "
+                    f"anchor!=measured on {len(dis)}/{len(frames)}: "
+                    f"{sorted(set(dis))}")
+        stack = np.stack([shift_rows(f.gray, d) for f, d in zip(frames, shifts)])
     else:
         stack = np.stack([f.gray for f in frames])
     return np.median(stack, axis=0).astype(np.uint8)
@@ -1430,7 +2821,14 @@ def build_pdf(strips: list[np.ndarray], out_pdf: Path, title: str) -> int:
 
     font = kr_font()
     doc = fitz.open()
-    tmp = out_pdf.parent / f"_page_{os.getpid()}.png"
+    # The page image never touches the disk. It used to be written to
+    # `out_pdf.parent/_page_<pid>.png` and handed back to PyMuPDF by NAME, and
+    # `cv2.imwrite` cannot write into a folder outside the Windows ANSI code
+    # page (see `imwrite` above), so on a Korean output folder every run died
+    # here -- after the whole 3-7 minute pipeline had already succeeded. An
+    # in-memory PNG is byte-for-byte the same image (verified: the rendered page
+    # is pixel-identical either way), needs no writable outdir at all, and drops
+    # a 26MB round trip to disk per page.
     for pi, page_strips in enumerate(pages):
         top = MARGIN + (head_px if pi == 0 else head_px // 2)
         canvas = np.full((A4_H, A4_W, 3), 255, np.uint8)
@@ -1438,9 +2836,11 @@ def build_pdf(strips: list[np.ndarray], out_pdf: Path, title: str) -> int:
         for s in page_strips:
             canvas[y:y + s.shape[0], MARGIN:MARGIN + s.shape[1]] = s
             y += s.shape[0] + gap
-        cv2.imwrite(str(tmp), canvas)
+        ok, buf = cv2.imencode(".png", canvas)
+        if not ok:
+            raise RuntimeError(f"page {pi + 1} could not be encoded")
         page = doc.new_page(width=595, height=842)      # A4 in points
-        page.insert_image(fitz.Rect(0, 0, 595, 842), filename=str(tmp))
+        page.insert_image(fitz.Rect(0, 0, 595, 842), stream=buf.tobytes())
         if font:
             page.insert_font(fontname="kr", fontfile=font)
             size, box = (17, fitz.Rect(40, 30, 555, 76)) if pi == 0 else \
@@ -1454,9 +2854,11 @@ def build_pdf(strips: list[np.ndarray], out_pdf: Path, title: str) -> int:
                 size -= 1
     doc.set_metadata({"title": title,
                       "producer": f"score_pdf {APP_VERSION} / customer {CUSTOMER_ID}"})
-    doc.save(str(out_pdf), deflate=True)
+    # ...and the PDF itself goes out through `write_bytes` for the same reason:
+    # `doc.save(str(path))` hands the name to MuPDF's own file layer, and the
+    # customer's chosen folder is the one part of this path we do not control.
+    out_pdf.write_bytes(doc.tobytes(deflate=True))
     doc.close()
-    tmp.unlink(missing_ok=True)
     log(f"pdf: {out_pdf} ({len(pages)} pages, {len(strips)} systems)")
     return len(pages)
 
@@ -1499,6 +2901,8 @@ def run(url: str, workdir: Path, outdir: Path, fps: float, dedup_thresh: float,
                                f"{len(lay.systems)} slot(s) were detected")
         tail_only = {pick.index(i) for i in (tail_slots or []) if i in pick}
         lay.systems = [lay.systems[i] for i in pick]
+        lay.crops = [lay.crops[i] for i in pick] if lay.crops else []
+        lay.crop_pad = [lay.crop_pad[i] for i in pick] if lay.crop_pad else []
         lay.staff_spans = [lay.staff_spans[i] for i in pick]
         lay.staff_rows = [lay.staff_rows[i] for i in pick]
         log(f"slots: using {pick} (tail-only: {sorted(tail_only)}) -> {lay.systems}")
@@ -1511,18 +2915,43 @@ def run(url: str, workdir: Path, outdir: Path, fps: float, dedup_thresh: float,
     # One float per pixel column per frame, so a 3 minute 1080p video costs
     # ~6MB per slot, which is nothing next to the frames themselves.
     colprofs: list[list[np.ndarray]] = [[] for _ in lay.systems]
+    # Per-frame ROW ink profile of the whole frame, for the vertical tracker.
+    # Full frame, not the slots: the tracker has to be able to tell the static
+    # chrome above and below the score from the page that moves past it.
+    rowprofs: list[np.ndarray] = []
     nframes = 0
-    plates = [lay.plate[y0:y1] for y0, y1 in lay.systems]
-    targets = [max(0, sp[0] - y0) for sp, (y0, _) in zip(lay.staff_spans, lay.systems)]
+    crop_boxes = lay.crop_boxes()
+    pads = lay.crop_pad or [(0, 0)] * len(crop_boxes)
+    plates = [lay.plate[y0:y1] for y0, y1 in crop_boxes]
+    targets = [max(0, sp[0] - y0) for sp, (y0, _) in zip(lay.staff_spans, crop_boxes)]
     staff_h = [sp[1] - sp[0] for sp in lay.staff_spans]
     up = int(round(4.0 * lay.staff_gap))
     down = int(round(4.0 * lay.staff_gap))
+    # The grouping/dedup pixels must stay EXACTLY the rows they were before the
+    # crop was allowed to grow, or every threshold calibrated on the eleven
+    # verified videos moves under it. Both windows are therefore measured in the
+    # detection box and then offset by the top pad, not re-derived in the crop.
+    cores_ab: list[tuple[int, int]] = []
+    head_ab: list[tuple[int, int]] = []
+    # The staff's own rows inside the crop, and nothing else: that is where the
+    # playhead is legible (see `playhead_x`).
+    staff_ab: list[tuple[int, int]] = []
+    for si, ((by0, by1), sp) in enumerate(zip(lay.systems, lay.staff_spans)):
+        tb = max(0, sp[0] - by0)
+        bh = by1 - by0
+        a = max(0, tb - up)
+        b = min(bh, tb + (sp[1] - sp[0]) + down)
+        pad_t = pads[si][0]
+        cores_ab.append((a + pad_t, b + pad_t))
+        head_ab.append((pad_t, max(0, tb - int(round(0.4 * lay.staff_gap))) + pad_t))
+        staff_ab.append((tb + pad_t, min(bh, tb + (sp[1] - sp[0])) + pad_t))
     for t, f in iter_frames(video, fps, lay.width, lay.height):
         nframes += 1
         if nframes % 20 == 0:
             report(0.32 + 0.45 * (t / max(duration, 1.0)))
-        for si, (y0, y1) in enumerate(lay.systems):
-            g = normalise_ink(f[y0:y1], plates[si], lay.polarity, sat)
+        rowprofs.append(row_ink(scroll_gray(f, lay.polarity)))
+        for si, (y0, y1) in enumerate(crop_boxes):
+            g = normalise_ink(f[y0:y1], plates[si], lay.polarity, sat, lay.staff_gap)
             prof = staff_row_coverage(g, "dark_ink")
             top = staff_anchor(prof, lay.staff_gap, targets[si])
             # Group frames on the STAFF, not on the whole box. The box is as tall
@@ -1543,13 +2972,18 @@ def run(url: str, workdir: Path, outdir: Path, fps: float, dedup_thresh: float,
             # only difference between sample case 0's measures 53-56 and 57-60
             # (four bars of rest under the same lyric). At two spaces the two
             # never separated and measure 57 was missing from the PDF.
-            a = max(0, targets[si] - up)
-            b = min(g.shape[0], targets[si] + staff_h[si] + down)
+            a, b = cores_ab[si]
+            b = min(g.shape[0], b)
             core = g[a:b] if b - a >= 8 else g
-            hcut = targets[si] - int(round(0.4 * lay.staff_gap))
-            hkey = signature(g[:hcut], HEAD_W, HEAD_H) if hcut >= 6 else None
+            h0, hcut = head_ab[si]
+            hkey = signature(g[h0:hcut], HEAD_W, HEAD_H) if hcut - h0 >= 6 else None
+            s0, s1 = staff_ab[si]
+            crop = f[y0:y1]
+            s1 = min(crop.shape[0], s1)
+            phx = playhead_x(crop[s0:s1], sat, lay.polarity) if s1 - s0 >= 8 else -1.0
             raw_slots[si].append(SlotFrame(t=t, gray=g, key=signature(core),
-                                           fp=fingerprint(core), hkey=hkey, top=top))
+                                           fp=fingerprint(core), hkey=hkey, top=top,
+                                           phx=phx))
             ridges[si].append(float(prof.max()))
             colprofs[si].append(column_ink(core))
 
@@ -1600,79 +3034,183 @@ def run(url: str, workdir: Path, outdir: Path, fps: float, dedup_thresh: float,
             f"({worst['sign_consistency']:.0%} of matched frame pairs move the same "
             f"way, only {worst['still_frac']:.0%} are stationary)")
 
-    # ---- per slot: dedup + composite + render
-    chromes: list[np.ndarray | None] = []
-    for si, (y0, y1) in enumerate(lay.systems):
-        if lay.polarity == "light_ink":
-            span = (lay.staff_spans[si][0] - y0, lay.staff_spans[si][1] - y0)
-            chromes.append(static_chrome(plates[si], span))
-        else:
-            chromes.append(None)
-
-    slot_groups: list[list[list[SlotFrame]]] = []
-    for si, sf in enumerate(slots):
-        groups = group_lines(sf, dedup_thresh) if sf else []
-        slot_groups.append(groups)
-        log(f"dedupe: slot {si}: {len(sf)} frames -> {len(groups)} distinct systems")
-
-    comps: list[list[np.ndarray]] = [[composite_line(g, lay.staff_gap) for g in gs]
-                                     for gs in slot_groups]
-    cores: list[list[np.ndarray]] = [[core_fingerprint(c, lay.staff_gap)
-                                      for c in cs] for cs in comps]
-    box_fps: list[list[np.ndarray]] = [[cv2.resize(c, (CORE_W, CORE_H),
-                                                   interpolation=cv2.INTER_AREA)
-                                        for c in cs] for cs in comps]
-    heads: list[list[np.ndarray]] = [[head_signature(c, lay.staff_gap) for c in cs]
-                                     for cs in comps]
-    times: list[list[float]] = [[g[0].t for g in gs] for gs in slot_groups]
-    if os.environ.get("YTSCORE_DIAG"):
-        import pickle
-        for si, cs in enumerate(comps):
-            if not cs:
-                continue
-            cv2.imwrite(str(outdir / f"{name}_cores_slot{si}.png"),
-                        np.vstack([np.vstack([c, np.zeros((4, CORE_W), np.uint8)])
-                                   for c in cores[si]]))
-        with open(outdir / f"{name}_slots.pkl", "wb") as fh:
-            pickle.dump({"cores": cores, "times": times, "gap": lay.staff_gap,
-                         "strength": [[ink_strength(c) for c in cs] for cs in comps]}, fh)
-
-    # "all" = every system of this slot, "tail" = only its final settled one.
-    mode = ["all"] * len(slots)
-    for i in tail_only:
-        mode[i] = "tail"
-    if not (use_slots or tail_slots):
-        roll = detect_rolling(times, cores)
-        if roll:
-            cur, prev = roll
-            mode = ["none"] * len(slots)
-            mode[cur], mode[prev] = "all", "tail"
-            log(f"rolling: slot {cur} is the current line, slot {prev} only previews it "
-                f"-> slot {cur} in full + slot {prev}'s last system")
-
+    # ---- the vertical page-scroll path.
+    # The horizontal guard just proved the band is not travelling sideways. It
+    # can still be travelling UP, in discrete jumps, which is a page being
+    # scrolled rather than a ribbon being pulled: every system is wholly on
+    # screen and stationary for seconds at a time, it just is not always in the
+    # SAME place. `analyse_layout`'s modal slot layout is an average over scroll
+    # phases in that case (215-221px slots against a 247px page pitch on the
+    # customer's H_uW2B5A1kE), which straddles every crop and hides every system
+    # from its own earlier copy. Register the page first, then lift each system
+    # once, from the frames where it is standing still.
+    vband = (min(y0 for y0, _ in lay.systems), max(y1 for _, y1 in lay.systems))
+    vtrack = vscroll_track(np.asarray(rowprofs, dtype=np.float32), fps, vband,
+                           lay.staff_gap)
+    rowprofs = []
+    log(f"vscroll: {vtrack['events']} step(s), median {vtrack['step_px']:.0f}px, "
+        f"{vtrack['travel_px']:.0f}px over {vtrack.get('travel_bands', 0):.1f} band "
+        f"heights, one-way {vtrack['one_way']:.2f}, band {vtrack['band']} "
+        f"-> {'SCROLLING PAGE' if vtrack['scrolling'] else 'stationary'}")
+    vinfo: dict = {}
     candidates: list[Cand] = []
-    for si, groups in enumerate(slot_groups):
-        if not groups or mode[si] == "none":
-            continue
-        picks = list(range(len(groups)))
-        if mode[si] == "tail":
-            # A rolling display previews the next line in the preview slot, so
-            # that slot repeats what the current slot shows a beat later --
-            # except for the very last system, which the video ends on before it
-            # ever rolls up. Take only that one, and only if it is a real system:
-            # the actual last group is usually a handful of frames of the outro
-            # fade, which medians into a ghosted copy of the line underneath it.
-            floor = 0.35 * float(np.median([len(g) for g in groups]))
-            solid = [i for i, g in enumerate(groups) if len(g) >= floor]
-            picks = (solid or picks)[-1:]
-            log(f"dedupe: slot {si} is tail-only, keeping its final settled system "
-                f"({len(groups[picks[0]])} frames, from t={times[si][picks[0]]:.1f}s)")
-        for i in picks:
-            strip = render_strip(comps[si][i], lay.polarity, chromes[si])
-            candidates.append(Cand(t=times[si][i], si=si, strip=strip,
-                                   core=cores[si][i], box=box_fps[si][i],
-                                   head=heads[si][i],
-                                   strength=ink_strength(comps[si][i])))
+    mode = ["all"] * len(slots)
+
+    if vtrack["scrolling"]:
+        slots = []              # the scroll path re-reads the video; free these
+        vcomps, vinfo = vscroll_extract(
+            video, lay, vtrack, fps, sat,
+            progress=lambda f: report(0.62 + 0.20 * f))
+        if len(vcomps) < 4:
+            raise ScrollingScore(
+                f"the page scrolls vertically ({vtrack['events']} steps of "
+                f"{vtrack['step_px']:.0f}px) but only {len(vcomps)} system(s) could "
+                f"be lifted from it")
+        for i, comp in enumerate(vcomps):
+            # `t` orders the candidates, and on a scrolling page the page's own
+            # row IS the reading order: a system that scrolled off the top was
+            # played before one that is still below the fold, whatever segment
+            # each was finally cropped from.
+            candidates.append(Cand(
+                t=float(i), si=0,
+                strip=render_strip(comp, lay.polarity, None),
+                core=core_fingerprint(comp, lay.staff_gap),
+                box=cv2.resize(comp, (CORE_W, CORE_H), interpolation=cv2.INTER_AREA),
+                head=head_signature(comp, lay.staff_gap),
+                strength=ink_strength(comp)))
+        log(f"vscroll: {len(candidates)} systems lifted from the page "
+            f"({vinfo.get('skipped', 0)} never wholly visible)")
+    else:
+        # ---- per slot: dedup + composite + render
+        chromes: list[np.ndarray | None] = []
+        for si, (y0, y1) in enumerate(crop_boxes):
+            if lay.polarity == "light_ink":
+                span = (lay.staff_spans[si][0] - y0, lay.staff_spans[si][1] - y0)
+                chromes.append(static_chrome(plates[si], span))
+            else:
+                chromes.append(None)
+
+        slot_groups: list[list[list[SlotFrame]]] = []
+        slot_slides: list[set[int]] = []
+        dt_sample = 1.0 / max(fps, 0.01)
+        for si, sf in enumerate(slots):
+            nmove = mark_travelling(sf, lay.staff_gap, dt_sample)
+            groups = group_lines(sf, dedup_thresh) if sf else []
+            slot_groups.append(groups)
+            slides = sliding_groups(groups, dt_sample)
+            slot_slides.append(slides)
+            seen_ph = sum(1 for f in sf if f.phx >= 0.0)
+            log(f"dedupe: slot {si}: {len(sf)} frames -> {len(groups)} distinct systems "
+                f"({nmove} frame(s) taken mid-slide, {len(slides)} group(s) inside a slide, "
+                f"playhead seen in {seen_ph}/{len(sf)} frame(s), "
+                f"{LAST_GROUP_RESETS} reset(s) in its track, "
+                f"{LAST_GROUP_SPLITS} group(s) split on one)")
+            if os.environ.get("YTSCORE_DIAG"):
+                for gi, g in enumerate(groups):
+                    tops = [f.top for f in g if f.top >= 0]
+                    hist = sorted(Counter(tops).items())
+                    mv = sum(1 for f in g if f.travelling)
+                    log(f"group?: slot {si} #{gi} t={g[0].t:.1f}..{g[-1].t:.1f}s "
+                        f"n={len(g)} moving={mv}/{len(g)} "
+                        f"slide={'y' if gi in slides else 'n'} tops={hist}")
+            if os.environ.get("YTSCORE_DUMP_DIST"):
+                with open(outdir / f"{name}_dist_slot{si}.tsv", "w") as fh:
+                    fh.write("t\tbinary\tgraded\theader\tplayhead\tnew\n")
+                    for t, bj, gj, hd, px, nw in LAST_GROUP_TRACE:
+                        fh.write(f"{t:.2f}\t{bj:.4f}\t{gj:.4f}\t{hd:.4f}\t{px:.4f}\t{nw}\n")
+            want = os.environ.get("YTSCORE_DUMP_GROUPS")
+            if want:
+                import pickle
+                for gi in [int(x) for x in want.split(",")]:
+                    if gi < len(groups):
+                        with open(outdir / f"{name}_g{si}_{gi}.pkl", "wb") as fh:
+                            pickle.dump([(f.t, f.top, f.gray) for f in groups[gi]], fh)
+
+        # Trim BEFORE the fingerprints are taken, not at render time: two copies
+        # of one system that came out of different slots only compare equal once
+        # both have been cut to the same extent, and it is that comparison that
+        # decides whether the system is printed once or twice.
+        # Tiled layouts only, for the same reason the crop is only grown there:
+        # with one slot the box IS the system and there is no neighbour to cut
+        # away from, so trimming can only move thresholds that eleven verified
+        # videos were calibrated on.
+        pitches = np.diff([sp[0] for sp in lay.staff_spans]) if len(lay.staff_spans) > 1 \
+            else np.array([])
+        tiled = pitches.size > 0
+        reach = float(np.median(pitches)) / 2.0 if tiled else 0.0
+        comps: list[list[np.ndarray]] = []
+        extents: list[list[tuple[int, int]]] = []
+        for si, gs in enumerate(slot_groups):
+            cs = [composite_line(g, lay.staff_gap) for g in gs]
+            ex = [system_extent(c, lay.staff_gap, targets[si], reach) if tiled
+                  else (0, c.shape[0]) for c in cs]
+            cut = [c[a:b] for c, (a, b) in zip(cs, ex)]
+            nt = sum(1 for c, (a, b) in zip(cs, ex) if (b - a) != c.shape[0])
+            if nt:
+                log(f"trim: slot {si}: {nt}/{len(cs)} system(s) cut back to their own "
+                    f"extent (box {crop_boxes[si][1] - crop_boxes[si][0]}px -> "
+                    f"{sorted({b.shape[0] for b in cut})}px)")
+            comps.append(cut)
+            extents.append(ex)
+        cores: list[list[np.ndarray]] = [[core_fingerprint(c, lay.staff_gap)
+                                          for c in cs] for cs in comps]
+        box_fps: list[list[np.ndarray]] = [[cv2.resize(c, (CORE_W, CORE_H),
+                                                       interpolation=cv2.INTER_AREA)
+                                            for c in cs] for cs in comps]
+        heads: list[list[np.ndarray]] = [[head_signature(c, lay.staff_gap) for c in cs]
+                                         for cs in comps]
+        times: list[list[float]] = [[g[0].t for g in gs] for gs in slot_groups]
+        if os.environ.get("YTSCORE_DIAG"):
+            import pickle
+            for si, cs in enumerate(comps):
+                if not cs:
+                    continue
+                imwrite(outdir / f"{name}_cores_slot{si}.png",
+                        np.vstack([np.vstack([c, np.zeros((4, CORE_W), np.uint8)])
+                                       for c in cores[si]]))
+            with open(outdir / f"{name}_slots.pkl", "wb") as fh:
+                pickle.dump({"cores": cores, "times": times, "gap": lay.staff_gap,
+                             "strength": [[ink_strength(c) for c in cs] for cs in comps]}, fh)
+
+        # "all" = every system of this slot, "tail" = only its final settled one.
+        mode = ["all"] * len(slots)
+        for i in tail_only:
+            mode[i] = "tail"
+        if not (use_slots or tail_slots):
+            roll = detect_rolling(times, cores)
+            if roll:
+                cur, prev = roll
+                mode = ["none"] * len(slots)
+                mode[cur], mode[prev] = "all", "tail"
+                log(f"rolling: slot {cur} is the current line, slot {prev} only previews it "
+                    f"-> slot {cur} in full + slot {prev}'s last system")
+
+        candidates: list[Cand] = []
+        for si, groups in enumerate(slot_groups):
+            if not groups or mode[si] == "none":
+                continue
+            picks = list(range(len(groups)))
+            if mode[si] == "tail":
+                # A rolling display previews the next line in the preview slot, so
+                # that slot repeats what the current slot shows a beat later --
+                # except for the very last system, which the video ends on before it
+                # ever rolls up. Take only that one, and only if it is a real system:
+                # the actual last group is usually a handful of frames of the outro
+                # fade, which medians into a ghosted copy of the line underneath it.
+                floor = 0.35 * float(np.median([len(g) for g in groups]))
+                solid = [i for i, g in enumerate(groups) if len(g) >= floor]
+                picks = (solid or picks)[-1:]
+                log(f"dedupe: slot {si} is tail-only, keeping its final settled system "
+                    f"({len(groups[picks[0]])} frames, from t={times[si][picks[0]]:.1f}s)")
+            for i in picks:
+                ca, cb = extents[si][i]
+                ch = None if chromes[si] is None else chromes[si][ca:cb]
+                strip = render_strip(comps[si][i], lay.polarity, ch)
+                candidates.append(Cand(t=times[si][i], si=si, strip=strip,
+                                       core=cores[si][i], box=box_fps[si][i],
+                                       head=heads[si][i],
+                                       strength=ink_strength(comps[si][i]),
+                                       sliding=i in slot_slides[si]))
 
     # ---- order across slots, then drop the repeats a rolling display produces.
     # A rolling display shows each system twice: once in the lower slot as the
@@ -1696,6 +3234,17 @@ def run(url: str, workdir: Path, outdir: Path, fps: float, dedup_thresh: float,
     if not prepared:
         raise ScoreNotFound("every candidate system was rejected as unusable")
 
+    if os.environ.get("YTSCORE_DIAG"):
+        # every candidate as it stands BEFORE the drop passes, named by slot and
+        # time: the only way to tell a system the pipeline lost from one it
+        # correctly refused to print twice.
+        cdir = outdir / f"{name}_cands"
+        cdir.mkdir(exist_ok=True)
+        for old in cdir.glob("*.png"):
+            old.unlink()
+        for i, c in enumerate(prepared):
+            imwrite(cdir / f"{i:03d}_s{c.si}_t{c.t:.1f}.png", c.strip)
+
     # Drop the systems that are mid-animation. Case 0 slides each line in with a
     # tilt, so the first and last groups are a skewed copy of a line that also
     # appears settled: their staff lines are not level, which shows up as a
@@ -1703,29 +3252,109 @@ def run(url: str, workdir: Path, outdir: Path, fps: float, dedup_thresh: float,
     covcut = 0.55 * float(np.median([c.cov for c in prepared]))
     settled = [c for c in prepared if c.cov >= covcut]
     unsettled = len(prepared) - len(settled)
+    for c in prepared:
+        if c.cov < covcut:
+            log(f"order: dropped slot {c.si} t={c.t:.1f}s as mid-animation "
+                f"(staff coverage {c.cov:.2f} < {covcut:.2f})")
 
-    cross_slot = len(lay.systems) > 1
+    # ...and the ones that are not a system at all, but an EMPTY BOX. Two of the
+    # customer's complaints are this same defect:
+    #
+    #   KsSlNq-ciko  "맨윗줄 공백" - system 000 is the uploader's intro panel,
+    #                0.4% ink, all of it the panel's border rule. The coverage
+    #                gate above cannot see it: that border rule is a full-width
+    #                dark row, so staff_row_coverage reads a confident 1.000.
+    #   YkjcWb63v0o  the "깨짐" half of "마지막장 같은마디 반복 깨짐" - its outro
+    #                system prints twice and the faint copy is debris: a staff
+    #                snapped at the top with a stray rule under it, 0.27% ink
+    #                against the good copy's 3.6%. Every similarity pass is
+    #                blind to that pair because the page moved 73 rows between
+    #                the two frames, so the two views never line up to compare.
+    #
+    # Neither is a dedup problem, so neither is fixed by deleting more
+    # aggressively on similarity -- which is what breaks d3t9j6DObN0, where five
+    # near-identical systems are all real. Ink is the axis that separates them:
+    # over the corpus's 630 prepared candidates the junk sits at 0.028-0.076 of
+    # its own video's median and the faintest REAL system anywhere is ling's
+    # 0.161 (a10 0.170, a06 0.171, case2 0.203, case0 0.215). The floor is the
+    # geometric middle of that empty band. See ci/blank_check.py.
+    shares = [ink_share(c.strip) for c in settled]
+    inkcut = INK_SHARE_FLOOR * float(np.median(shares)) if shares else 0.0
+    empty = [c for c, sh in zip(settled, shares) if sh < inkcut]
+    for c, sh in zip(settled, shares):
+        if sh < inkcut:
+            log(f"order: dropped slot {c.si} t={c.t:.1f}s as an empty box "
+                f"(ink share {sh:.4f} < {inkcut:.4f}, this video's median "
+                f"{float(np.median(shares)):.4f})")
+    if empty:
+        settled = [c for c, sh in zip(settled, shares) if sh >= inkcut]
+
+    # ...and the ones lifted out of a page that never stopped moving. The
+    # coverage gate above catches a line that slides in TILTED (case 0); it
+    # cannot see a page that scrolls LEVEL, because a level scroll leaves the
+    # staff lines perfectly straight -- straighter, measurably, than this
+    # customer's real music. That is what YkjcWb63v0o does at the end, and its
+    # three sliding frames were printing the last system three extra times.
+    # See `mark_travelling` and `sliding_groups`.
+    sliding = [c for c in settled if c.sliding]
+    for c in sliding:
+        log(f"order: dropped slot {c.si} t={c.t:.1f}s as a mid-slide sample "
+            f"(the page was still moving a sample period later)")
+    if sliding:
+        settled = [c for c in settled if not c.sliding]
+
+    # On the scroll path each system was lifted from the page exactly once, at
+    # its own content row, so there is nothing to dedup and every remaining
+    # repeat is a repeat the composer wrote. Running the slot-repeat passes
+    # there would delete real music.
+    cross_slot = len(lay.systems) > 1 and not vtrack["scrolling"]
+    # The picture on its own is NOT enough to call two strips the same system.
+    # Bars 57 and 61 of zDG0Tw7MDXg are the same groove written twice, so their
+    # strips sit 0.071 apart, well inside the 0.30 dedup distance, and bar 61 was
+    # deleted from the PDF. What separates them is the measure number, which is
+    # exactly what `head_signature` isolates and what `drop_adjacent_repeats`
+    # already requires; this pass simply was not asking. A real cross-slot repeat
+    # (a rolling display showing one system in two slots) carries the SAME number
+    # and is still dropped.
     kept_cands: list[Cand] = []
     keys: list[np.ndarray] = []
+    heads_seen: list[np.ndarray] = []
     dropped_dupes = 0
     for c in settled:
         k = signature(cv2.cvtColor(c.strip, cv2.COLOR_BGR2GRAY))
-        if cross_slot and any(jaccard(k, prev) <= dedup_thresh for prev in keys[-4:]):
+        dupe = None
+        if cross_slot:
+            for pk, ph in zip(keys[-4:], heads_seen[-4:]):
+                d = jaccard(k, pk)
+                if d > dedup_thresh:
+                    continue
+                hd = jaccard(ph, c.head) if c.head is not None and ph is not None else 0.0
+                if hd <= HEAD_SAME:
+                    dupe = (d, hd)
+                    break
+        if dupe is not None:
+            log(f"order: dropped slot {c.si} t={c.t:.1f}s as a cross-slot repeat "
+                f"(picture {dupe[0]:.3f}, header {dupe[1]:.3f})")
             dropped_dupes += 1
             continue
         kept_cands.append(c)
         keys.append(k)
+        heads_seen.append(c.head)
     log(f"order: {len(candidates)} candidates -> {len(kept_cands)} systems "
         f"({unsettled} mid-animation, {dropped_dupes} cross-slot repeats dropped)")
 
     if os.environ.get("YTSCORE_DIAG"):
         import pickle
         with open(outdir / f"{name}_cands.pkl", "wb") as fh:
-            pickle.dump([{"t": c.t, "si": c.si, "core": c.core, "strength": c.strength,
+            pickle.dump([{"t": c.t, "si": c.si, "core": c.core, "box": c.box,
+                          "head": c.head, "strength": c.strength,
                           "cov": c.cov} for c in kept_cands], fh)
 
-    kept_cands, faded = drop_fade_copies(kept_cands)
-    kept_cands, repeats = drop_adjacent_repeats(kept_cands)
+    if vtrack["scrolling"]:
+        faded, repeats = [], []
+    else:
+        kept_cands, faded = drop_fade_copies(kept_cands)
+        kept_cands, repeats = drop_adjacent_repeats(kept_cands)
     cleaned: list[np.ndarray] = [c.strip for c in kept_cands]
 
     if drop_idx:
@@ -1743,6 +3372,19 @@ def run(url: str, workdir: Path, outdir: Path, fps: float, dedup_thresh: float,
     # link produced 672 systems from 728 frames (a 45 page PDF reported as OK).
     # Both bounds have to break before this refuses, and both sit ~4x outside
     # the worst real video, so a genuinely dense score is never caught by it.
+    #
+    # Tier 2 (systems against the DURATION of the video) is the one the vertical
+    # scroll needed: H_uW2B5A1kE printed 75 systems for a 25 system chart and
+    # sailed straight through tier 1, because 75 is not 672 and 0.03 is not 0.35.
+    # A system is roughly four bars, so its count per minute is bounded by the
+    # tempo: the fourteen verified videos run 5.1 to 9.6 systems per minute and
+    # the broken run measured 19.0. The cut sits at 16.0, two thirds above the
+    # worst real video and still below the failure.
+    #
+    # Tier 3 is exact rather than statistical, and only exists on a page that
+    # really did scroll: the page cannot contain more systems than its own
+    # travel plus one screen can hold. It is the bound that would have caught
+    # the 3x over-count on the first run, whatever the cause.
     per_min = len(cleaned) / max(duration / 60.0, 0.1)
     yield_ratio = len(cleaned) / float(max(kept, 1))
     log(f"sanity: {len(cleaned)} systems, {per_min:.1f}/min of video, "
@@ -1752,6 +3394,21 @@ def run(url: str, workdir: Path, outdir: Path, fps: float, dedup_thresh: float,
             f"dedup did not converge: {len(cleaned)} systems out of {kept} "
             f"collected frames ({per_min:.0f} per minute of video), which is what "
             f"a continuously moving score looks like")
+    if len(cleaned) >= 30 and per_min >= SANITY_MAX_PER_MIN:
+        raise ScrollingScore(
+            f"{len(cleaned)} systems for {duration / 60.0:.1f} minutes of video is "
+            f"{per_min:.0f} per minute, against 5-10 on every verified score: the "
+            f"same music is being printed more than once")
+    if vtrack["scrolling"] and vtrack["step_px"] > 0:
+        span = vtrack["travel_px"] + (vtrack["band"][1] - vtrack["band"][0])
+        room = span / max(vtrack["step_px"], 1.0)
+        log(f"sanity: the page travelled {vtrack['travel_px']:.0f}px in "
+            f"{vtrack['step_px']:.0f}px steps, so it holds about {room:.0f} systems")
+        if len(cleaned) > 1.6 * room:
+            raise ScrollingScore(
+                f"{len(cleaned)} systems were printed from a page that only "
+                f"scrolled {span:.0f}px, i.e. room for about {room:.0f}: the same "
+                f"music is being printed more than once")
 
     report(0.88)
     if not title_override and not meta.get("title"):
@@ -1770,7 +3427,7 @@ def run(url: str, workdir: Path, outdir: Path, fps: float, dedup_thresh: float,
         old.unlink()
     bars = []
     for i, s in enumerate(cleaned):
-        cv2.imwrite(str(strip_dir / f"{i:03d}.png"), s)
+        imwrite(strip_dir / f"{i:03d}.png", s)
         bars.append(count_measures(s))
 
     elapsed = time.time() - t0
@@ -1780,8 +3437,11 @@ def run(url: str, workdir: Path, outdir: Path, fps: float, dedup_thresh: float,
         "system_boxes": lay.systems, "staff_gap": round(lay.staff_gap, 1),
         "sampled": nframes, "score_frames": kept, "rejected": rejected,
         "candidates": len(candidates), "unsettled_dropped": unsettled,
+        "sliding_dropped": len(sliding), "empty_dropped": len(empty),
         "cross_slot_dupes": dropped_dupes, "slot_mode": mode,
         "scroll": scroll_stats, "systems_per_min": round(per_min, 1),
+        "vscroll": {k: v for k, v in vtrack.items() if k != "offsets"},
+        "vscroll_extract": vinfo,
         "systems_per_frame": round(yield_ratio, 4),
         "fade_copies_dropped": faded, "redrawn_copies_dropped": repeats,
         "systems": len(cleaned), "dropped_by_hand": sorted(drop_idx or []),

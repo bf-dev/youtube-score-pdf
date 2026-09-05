@@ -3,7 +3,7 @@
 
 APP_SLUG = "youtube-score-pdf"          # ASCII: exe name, install dir, zip top level
 APP_NAME = "유튜브 악보 PDF 변환기"        # what the customer sees
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.7.2"
 
 CUSTOMER_ID = "1775529"
 
